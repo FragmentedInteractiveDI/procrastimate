@@ -16,6 +16,7 @@ import {
   getCoinToUsdRate,
   getUsdSkimPct,
   MICRO_PER_MATE,
+  onChange,
 } from "../modules/wallet";
 import {
   getBoostTimes,
@@ -52,7 +53,7 @@ const toMate = (micro = 0) =>
 
 /* ---------- screen ---------- */
 export default function Payouts() {
-  const w = usePoll(getWallet, 600);
+  const [w, setW] = useState(getWallet);
   const stats = usePoll(getStats, 1200);
   const kyc = usePoll(getKycStatus, 2000);
 
@@ -61,6 +62,14 @@ export default function Payouts() {
   const [toast, setToast] = useState("");
 
   const gateBlocked = !canWatchAd();
+
+  // Listen to wallet changes directly instead of polling
+  useEffect(() => {
+    const unsubscribe = onChange((newWallet) => {
+      setW(newWallet);
+    });
+    return unsubscribe;
+  }, []);
 
   useEffect(() => {
     const id = setInterval(() => {

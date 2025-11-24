@@ -87,7 +87,6 @@ export function getUsdSkimPct() {
 
 /* ---------- storage + notify ---------- */
 let savePending = false;
-let lastNotifyAt = 0;
 const listeners = new Set();
 
 function readRaw() {
@@ -100,7 +99,12 @@ function readRaw() {
 function writeRawImmediate(w) {
   try {
     localStorage.setItem(KEY, JSON.stringify(w));
-  } catch {}
+    
+    // Verify it was saved
+    const verify = JSON.parse(localStorage.getItem(KEY) || "null");
+  } catch (e) {
+    console.error("❌ localStorage.setItem FAILED:", e);
+  }
   return w;
 }
 function persistSoon(w) {
@@ -112,9 +116,6 @@ function persistSoon(w) {
   }, 120);
 }
 function notify() {
-  const now = performance.now?.() ?? Date.now();
-  if (now - lastNotifyAt < 90) return;
-  lastNotifyAt = now;
   const snap = getWallet();
   for (const f of listeners) {
     try {
@@ -214,14 +215,10 @@ export function depositMicro(micro = 0, meta = {}) {
   w.micro += add;
   syncLegacyCoins(w);
 
-  // For ad rewards, we log coins separately (see creditUsdReview),
-  // so skip the generic micro_add history here to avoid duplicates.
-  const isAd = meta && meta.src === "ad";
-  if (!isAd) {
-    pushHist(w, "micro_add", add, meta);
-  }
+  // Always log deposits to history
+  pushHist(w, "micro_add", add, meta);
 
-  write(w);
+  writeRawImmediate(w);
   notify();
   try {
     addCoinsEarned(Math.round(add / MICRO_PER_MATE));
@@ -263,7 +260,7 @@ export function addCoins(n = 0) {
     localStorage.setItem(CARRY_KEY, JSON.stringify(frac));
   } catch {}
 
-  write(w);
+  writeRawImmediate(w);
   notify();
   return w;
 }
@@ -276,7 +273,7 @@ export function spendMate(mate = 0, meta = {}) {
   w.micro -= need;
   syncLegacyCoins(w);
   pushHist(w, "micro_spend", -need, meta);
-  write(w);
+  writeRawImmediate(w);
   notify();
   return { ok: true, wallet: w };
 }
@@ -291,12 +288,20 @@ export function grantAdReward({ baseCoins = 0, boostMult = 1 }) {
 
 /* ---------- USD review/hold + cap ---------- */
 export function creditUsdReview(amount = 0, meta = {}) {
+  
   const add = Math.max(0, Number(amount) || 0);
-  if (add <= 0) return getWallet();
+  
+  if (add <= 0) {
+    return getWallet();
+  }
 
   const w = norm(readRaw());
   const cents = Math.round(add * 100);
-  if (cents <= 0) return w;
+  
+  if (cents <= 0) {
+    return w;
+  }
+  
   const addRounded = cents / 100;
 
   w.usd_review_hold = Math.max(
@@ -304,29 +309,20 @@ export function creditUsdReview(amount = 0, meta = {}) {
     Number(((w.usd_review_hold * 100 + cents) / 100).toFixed(2))
   );
 
-  const isAd = meta && meta.src === "ad";
-  const coins = isAd ? Math.round(Number(meta.coins) || 0) : 0;
-
-  // If this was an ad reward, log a clean coin entry first.
-  if (isAd && coins > 0) {
-    const extra = {};
-    if (meta.offerId) extra.offerId = meta.offerId;
-    if (meta.tier != null) extra.tier = meta.tier;
-    pushHist(w, "coins_add", coins, extra);
-  }
-
   const histKey = meta?.k ? String(meta.k) : "review_add";
   const extraUsd = meta?.offerId ? { offerId: meta.offerId } : {};
   pushHist(w, histKey, addRounded, extraUsd);
 
-  write(w);
+  writeRawImmediate(w);  // ← Use immediate write instead of delayed write
   notify();
 
   // Only true "skim" (auto drip) should hit the skim stats.
+  const isAd = meta && meta.src === "ad";
   if (!isAd) {
     try {
       addUsdSkim(addRounded);
     } catch {}
+  } else {
   }
   recordEarnEvent();
   return w;
@@ -346,7 +342,7 @@ export function releaseUsdHold() {
   const amt = Math.min(capLeft, w.usd_review_hold);
   if (amt <= 0) {
     pushHist(w, "review_blocked_cap", 0);
-    return write(w);
+    return writeRawImmediate(w);
   }
 
   w.usd_review_hold = Number((w.usd_review_hold - amt).toFixed(2));
@@ -354,7 +350,7 @@ export function releaseUsdHold() {
   w.usd_ytd = Number((w.usd_ytd + amt).toFixed(2));
 
   pushHist(w, "review_release", amt);
-  write(w);
+  writeRawImmediate(w);
   notify();
   return w;
 }
@@ -380,7 +376,7 @@ function tickOnce() {
         w.micro += addMicro;
         syncLegacyCoins(w);
         pushHist(w, "passive_tick_micro", addMicro);
-        write(w);
+        writeRawImmediate(w);  // Use immediate write
         notify();
         try {
           addCoinsEarned(Math.round(addMicro / MICRO_PER_MATE));
@@ -399,7 +395,7 @@ function catchUpOffline(w) {
 
   if (last === 0) {
     w.last_tick_ms = now;
-    return write(w);
+    return writeRawImmediate(w);  // Use immediate write
   }
 
   const capped = Math.min(delta, OFFLINE_CAP_MS);
@@ -422,13 +418,13 @@ function catchUpOffline(w) {
   }
 
   w.last_tick_ms = now;
-  return write(w);
+  return writeRawImmediate(w);  // Use immediate write
 }
 
 function startTicker() {
   if (window.__pm_wallet_tick) clearInterval(window.__pm_wallet_tick);
   const w = norm(readRaw());
-  write(catchUpOffline(w));
+  writeRawImmediate(catchUpOffline(w));  // Use immediate write
   const skew = Date.now() % TICK_MS;
   setTimeout(() => {
     tickOnce();

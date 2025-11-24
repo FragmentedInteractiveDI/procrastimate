@@ -141,20 +141,19 @@ export async function watchAd(kind = 1) {
     const baseCoins = cfg.baseCoins;
     const coins = Math.floor(baseCoins * Math.max(1, Number(mult) || 1));
 
+
+    // Deposit coins (no src: "ad" - let it log normally)
     if (coins > 0) {
-      // depositMate updates the micro balance; history for ad drops
-      // is logged in creditUsdReview so we pass src: "ad" here.
-      depositMate(coins, { src: "ad", tier: kind, offerId: cfg.id });
+      depositMate(coins, { tier: kind, offerId: cfg.id });
     }
 
-    // Credit USD share to Review; wallet logs both USD + coin history
+    // Credit USD share (WITH src: "ad" to prevent skim tracking)
     if (usdShare > 0) {
       creditUsdReview(usdShare, {
         k: "ad_usd_share",
         offerId: cfg.id,
-        src: "ad",
-        coins,
         tier: kind,
+        src: "ad",
       });
     }
 
