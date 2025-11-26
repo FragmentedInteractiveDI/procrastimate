@@ -1,68 +1,156 @@
 // FILE: src/context/AvatarContext.jsx
 import { createContext, useContext, useEffect, useMemo, useState } from "react";
 
-const LS_KEY = "pm_avatar_v1";
-const defaultEquipped = { hat: null, skin: null };
+const LS_KEY = "pm_avatar_v2"; // v2 for new body system
+const LS_RENAME_KEY = "pm_avatar_rename_count_v1";
+
+const DEFAULT_AVATAR = {
+  bodyId: "mate_bibby",        // Default ProcrastiMate
+  expressionId: "expr_happy",   // Default expression
+  hatId: null,                  // No hat by default
+  customName: null,             // Player's custom name (null = use default body name)
+};
 
 function readLS() {
   try {
     const raw = JSON.parse(localStorage.getItem(LS_KEY) || "null");
-    const hat = typeof raw?.hat === "string" ? raw.hat : null;
-    const skin = typeof raw?.skin === "string" ? raw.skin : null;
-    return { hat, skin };
+    if (!raw || typeof raw !== "object") return { ...DEFAULT_AVATAR };
+    
+    return {
+      bodyId: typeof raw.bodyId === "string" ? raw.bodyId : DEFAULT_AVATAR.bodyId,
+      expressionId: typeof raw.expressionId === "string" ? raw.expressionId : DEFAULT_AVATAR.expressionId,
+      hatId: typeof raw.hatId === "string" ? raw.hatId : DEFAULT_AVATAR.hatId,
+      customName: typeof raw.customName === "string" ? raw.customName : null,
+    };
   } catch {
-    return { ...defaultEquipped };
+    return { ...DEFAULT_AVATAR };
   }
 }
-function writeLS(equipped) {
-  try { localStorage.setItem(LS_KEY, JSON.stringify(equipped)); } catch {}
+
+function writeLS(avatar) {
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify(avatar));
+  } catch (e) {
+    console.warn("Failed to persist avatar:", e);
+  }
+}
+
+// Rename count tracking
+function getRenameCount() {
+  try {
+    const count = parseInt(localStorage.getItem(LS_RENAME_KEY) || "0", 10);
+    return isNaN(count) ? 0 : count;
+  } catch {
+    return 0;
+  }
+}
+
+function setRenameCount(count) {
+  try {
+    localStorage.setItem(LS_RENAME_KEY, String(count));
+  } catch {}
 }
 
 const AvatarContext = createContext({
-  equipped: defaultEquipped,
-  equipHat: (_id) => {},
-  equipSkin: (_id) => {},
-  setEquipped: (_obj) => {},
-  resetEquipped: () => {},
+  avatar: DEFAULT_AVATAR,
+  setBody: () => {},
+  setExpression: () => {},
+  setHat: () => {},
+  setCustomName: () => {},
+  resetAvatar: () => {},
+  getRenameCount: () => 0,
+  getRenameCost: () => 0,
 });
+
 AvatarContext.displayName = "AvatarContext";
 
 export function AvatarProvider({ children }) {
-  const [equipped, setEquippedState] = useState(() => readLS());
+  const [avatar, setAvatarState] = useState(() => readLS());
+  const [renameCount, setRenameCountState] = useState(() => getRenameCount());
 
-  // persist to LS
-  useEffect(() => { writeLS(equipped); }, [equipped]);
+  useEffect(() => {
+    writeLS(avatar);
+  }, [avatar]);
 
-  // broadcast lightweight event for listeners (MateBanner, etc.)
+  useEffect(() => {
+    setRenameCount(renameCount);
+  }, [renameCount]);
+
   useEffect(() => {
     try {
-      window?.dispatchEvent?.(new CustomEvent("pm:avatar:equip", { detail: equipped }));
+      window.dispatchEvent(
+        new CustomEvent("pm:avatar:change", { detail: avatar })
+      );
     } catch {}
-  }, [equipped]);
+  }, [avatar]);
 
-  // actions
-  const equipHat = (id) =>
-    setEquippedState((prev) => ({ ...prev, hat: typeof id === "string" ? id : null }));
+  const setBody = (id) => {
+    setAvatarState((prev) => ({
+      ...prev,
+      bodyId: typeof id === "string" ? id : DEFAULT_AVATAR.bodyId,
+    }));
+  };
 
-  const equipSkin = (id) =>
-    setEquippedState((prev) => ({ ...prev, skin: typeof id === "string" ? id : null }));
+  const setExpression = (id) => {
+    setAvatarState((prev) => ({
+      ...prev,
+      expressionId: typeof id === "string" ? id : DEFAULT_AVATAR.expressionId,
+    }));
+  };
 
-  const setEquipped = (obj = {}) =>
-    setEquippedState({
-      hat: typeof obj.hat === "string" ? obj.hat : null,
-      skin: typeof obj.skin === "string" ? obj.skin : null,
+  const setHat = (id) => {
+    setAvatarState((prev) => ({
+      ...prev,
+      hatId: typeof id === "string" ? id : null,
+    }));
+  };
+
+  const setCustomName = (name) => {
+    setAvatarState((prev) => ({
+      ...prev,
+      customName: typeof name === "string" && name.trim() ? name.trim() : null,
+    }));
+    
+    // Increment rename count
+    setRenameCountState((prev) => {
+      const newCount = prev + 1;
+      setRenameCount(newCount);
+      return newCount;
     });
+  };
 
-  const resetEquipped = () => setEquippedState({ ...defaultEquipped });
+  const resetAvatar = () => {
+    setAvatarState({ ...DEFAULT_AVATAR });
+  };
+
+  // Calculate rename cost: First rename is FREE (0 coins), then 100 coins each
+  const getRenameCost = () => {
+    return renameCount === 0 ? 0 : 100;
+  };
 
   const value = useMemo(
-    () => ({ equipped, equipHat, equipSkin, setEquipped, resetEquipped }),
-    [equipped]
+    () => ({ 
+      avatar, 
+      setBody, 
+      setExpression, 
+      setHat, 
+      setCustomName, 
+      resetAvatar,
+      getRenameCount: () => renameCount,
+      getRenameCost,
+    }),
+    [avatar, renameCount]
   );
 
-  return <AvatarContext.Provider value={value}>{children}</AvatarContext.Provider>;
+  return (
+    <AvatarContext.Provider value={value}>{children}</AvatarContext.Provider>
+  );
 }
 
 export function useAvatar() {
-  return useContext(AvatarContext);
+  const context = useContext(AvatarContext);
+  if (!context) {
+    throw new Error("useAvatar must be used within AvatarProvider");
+  }
+  return context;
 }

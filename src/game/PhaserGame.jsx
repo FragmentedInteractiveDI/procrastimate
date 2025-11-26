@@ -2,25 +2,40 @@
 import { useEffect, useRef } from "react";
 import Phaser from "phaser";
 import CityScene from "./scenes/CityScene";
+import HomeCleanupScene from "./scenes/HomeCleanupScene";
 
 const WIDTH = 960;
 const HEIGHT = 600;
 
 /**
- * Mounts a single Phaser instance hosting CityScene.
+ * Mounts a single Phaser instance.
+ *
  * Props:
  *   - dark: boolean theme toggle (updates camera/canvas bg without remount)
  *   - onReady: function(game, { scene, api }) called once when CityScene is running
+ *   - sceneKey: which scene to start: "CityScene" | "HomeCleanupScene" (default "CityScene")
+ *   - onHomeCleanupResult: optional callback(payload) when HomeCleanupScene finishes.
+ *       The scene should emit: game.events.emit("homeCleanup:complete", { coins, runId, ... })
  */
-export default function PhaserGame({ dark = true, onReady }) {
+export default function PhaserGame({
+  dark = true,
+  onReady,
+  sceneKey = "CityScene",
+  onHomeCleanupResult,
+}) {
   const holderRef = useRef(null);
   const gameRef = useRef(null);
   const onReadyRef = useRef(onReady);
+  const homeCleanupRef = useRef(onHomeCleanupResult);
 
-  // keep latest callback without recreating the game
+  // keep latest callbacks without recreating the game
   useEffect(() => {
     onReadyRef.current = onReady;
   }, [onReady]);
+
+  useEffect(() => {
+    homeCleanupRef.current = onHomeCleanupResult;
+  }, [onHomeCleanupResult]);
 
   // create the game once on first mount
   useEffect(() => {
@@ -40,7 +55,10 @@ export default function PhaserGame({ dark = true, onReady }) {
         powerPreference: "high-performance",
         roundPixels: true,
       },
-      physics: { default: "arcade", arcade: { gravity: { y: 0 }, debug: false } },
+      physics: {
+        default: "arcade",
+        arcade: { gravity: { y: 0 }, debug: false },
+      },
       scale: {
         mode: Phaser.Scale.FIT,
         autoCenter: Phaser.Scale.CENTER_BOTH,
@@ -51,11 +69,24 @@ export default function PhaserGame({ dark = true, onReady }) {
       // (Phaser gracefully falls back if unsupported)
       disableContextMenu: true,
       fps: { target: 60, min: 30, forceSetTimeOut: false },
-      scene: [CityScene],
+      // NOTE: CityScene is still the default startup scene; we may switch below.
+      scene: [CityScene, HomeCleanupScene],
     };
 
     const game = new Phaser.Game(config);
     gameRef.current = game;
+
+    // Bridge: home cleanup mini-game result → React callback
+    const onCleanupComplete = (payload) => {
+      try {
+        if (typeof homeCleanupRef.current === "function") {
+          homeCleanupRef.current(payload || {});
+        }
+      } catch {
+        // swallow errors from userland callback
+      }
+    };
+    game.events?.on?.("homeCleanup:complete", onCleanupComplete);
 
     // Helper to emit once CityScene has created its registry API
     const emitReady = () => {
@@ -63,7 +94,9 @@ export default function PhaserGame({ dark = true, onReady }) {
       if (!scene) return false;
       const api = scene.registry?.get?.("cityApi");
       if (api) {
-        if (typeof onReadyRef.current === "function") onReadyRef.current(game, { scene, api });
+        if (typeof onReadyRef.current === "function") {
+          onReadyRef.current(game, { scene, api });
+        }
         return true;
       }
       return false;
@@ -73,22 +106,44 @@ export default function PhaserGame({ dark = true, onReady }) {
     const tryEmitSoon = () => {
       if (emitReady()) return;
       // a couple of rAFs ensures CityScene.create() ran and set registry
-      requestAnimationFrame(() => requestAnimationFrame(emitReady));
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => {
+          emitReady();
+        })
+      );
     };
 
     // Core ready
     game.events?.once?.(Phaser.Core.Events.READY, () => {
-      try { holder.focus({ preventScroll: true }); } catch {}
-      tryEmitSoon();
+      try {
+        holder.focus({ preventScroll: true });
+      } catch {}
+
+      // Explicitly start requested scene (default remains CityScene)
+      try {
+        if (sceneKey && typeof game.scene.start === "function") {
+          game.scene.start(sceneKey);
+        }
+      } catch {
+        // if bad key is passed we just let Phaser keep the default
+      }
+
+      // If we're running CityScene, wire its registry API as before.
+      if (sceneKey === "CityScene") {
+        tryEmitSoon();
+      }
     });
 
-    // When CityScene actually starts
-    const onSceneStart = (key) => { if (key === "CityScene") tryEmitSoon(); };
+    // When CityScene actually starts (for cases where it gets restarted)
+    const onSceneStart = (key) => {
+      if (key === "CityScene") tryEmitSoon();
+    };
     game.scene?.events?.on?.("start", onSceneStart);
 
     // Keep canvas crisp on odd DPR changes
     const onResize = () => game.scale.refresh();
-    const onVis = () => (document.hidden ? game.loop.sleep() : game.loop.wake());
+    const onVis = () =>
+      document.hidden ? game.loop.sleep() : game.loop.wake();
     const onPointerDown = () => holder.focus();
 
     window.addEventListener("resize", onResize);
@@ -100,6 +155,7 @@ export default function PhaserGame({ dark = true, onReady }) {
       document.removeEventListener("visibilitychange", onVis);
       holder.removeEventListener("pointerdown", onPointerDown);
       game.scene?.events?.off?.("start", onSceneStart);
+      game.events?.off?.("homeCleanup:complete", onCleanupComplete);
 
       if (gameRef.current) {
         // Full destroy including scenes/textures; also clear parent content
@@ -109,7 +165,7 @@ export default function PhaserGame({ dark = true, onReady }) {
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, []); // create once
 
   // theme sync without remounting Phaser
   useEffect(() => {

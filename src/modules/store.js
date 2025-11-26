@@ -1,6 +1,6 @@
 // FILE: src/modules/store.js
 // Logic-only store module. Uses wallet v3 for balances and spending.
-// Adds city SKUs (roads, grid size), passive/gate flags, and consumables.
+// Updated with ProcrastiMate bodies (Bibby, Blossom, Scrab, Rays)
 
 import { getWallet, spendMate } from "./wallet";
 
@@ -34,7 +34,7 @@ function writeJSON(key, val) {
 function load() {
   return readJSON(KEY_STATE, {
     owned: {},
-    equipped: { hat: null, skin: null },
+    equipped: { body: null, expression: null, hat: null },
   });
 }
 function save(s) {
@@ -75,37 +75,250 @@ function addCityExtraCells(n = 0) {
 }
 
 // ---------- CATALOG ----------
-//
-// type:
-//   - "cosmetic"  : permanent ownership (stays through prestige)
-//   - "business"  : permanent ownership; grants passive bonus (aggregated)
-//   - "city_item" : consumable pack routed to buildInventory (e.g., roads)
-//                    lives under pm_build_inv_v2 and is wiped by prestige
-//   - "city_size" : increases grid capacity; NOT owned; prestige-gated
-//
-// flags:
-//   - grantsPassive   : item contributes passive income (we generally avoid selling these)
-//   - sellable        : true if item is allowed to be sold back (future)
-//   - prestigeMin     : required prestige level to purchase
-//   - consumableQty   : for city_item, how many pieces granted
-//   - invId           : buildInventory tile id to grant
-//   - citySizeDelta   : for city_size, how many 1x1 cells unlocked
-//
 const CATALOG = [
-  // ---- cosmetics (Mate spend, permanent) ----
+  // ---- PROCRASTIMATE BODIES (permanent ownership, unique characters) ----
   {
-    id: "hat_cap",
-    name: "Cap",
+    id: "mate_bibby",
+    name: "Bibby",
+    description: "The friendly blue ProcrastiMate. Reliable and always ready to help!",
+    type: "cosmetic",
+    priceCoins: 0, // FREE starter
+    priceGems: 0,
+    category: "avatar",
+    subtype: "body",
+  },
+  {
+    id: "mate_blossom",
+    name: "Blossom",
+    description: "The energetic purple ProcrastiMate with iconic antenna!",
+    type: "cosmetic",
+    priceCoins: 1000,
+    priceGems: 0,
+    category: "avatar",
+    subtype: "body",
+  },
+  {
+    id: "mate_scrab",
+    name: "Scrab",
+    description: "The feisty red ProcrastiMate. Scrappy and full of fire!",
+    type: "cosmetic",
+    priceCoins: 1000,
+    priceGems: 0,
+    category: "avatar",
+    subtype: "body",
+  },
+  {
+    id: "mate_rays",
+    name: "Rays",
+    description: "The sunny yellow ProcrastiMate. Radiates good vibes!",
+    type: "cosmetic",
+    priceCoins: 1000,
+    priceGems: 0,
+    category: "avatar",
+    subtype: "body",
+  },
+
+  // ---- EXPRESSIONS (work on all bodies!) ----
+  {
+    id: "expr_happy",
+    name: "Happy",
+    description: "Classic cheerful expression",
+    type: "cosmetic",
+    priceCoins: 0, // FREE starter
+    priceGems: 0,
+    category: "avatar",
+    subtype: "expression",
+  },
+  {
+    id: "expr_anxious",
+    name: "Anxious",
+    description: "Worried and nervous look",
+    type: "cosmetic",
+    priceCoins: 300,
+    priceGems: 0,
+    category: "avatar",
+    subtype: "expression",
+  },
+  {
+    id: "expr_tired",
+    name: "Tired",
+    description: "Sleepy and exhausted",
+    type: "cosmetic",
+    priceCoins: 300,
+    priceGems: 0,
+    category: "avatar",
+    subtype: "expression",
+  },
+  {
+    id: "expr_sad",
+    name: "Sad",
+    description: "Down and gloomy mood",
+    type: "cosmetic",
+    priceCoins: 400,
+    priceGems: 0,
+    category: "avatar",
+    subtype: "expression",
+  },
+  {
+    id: "expr_lovely",
+    name: "Lovely",
+    description: "Heart eyes! In love and happy",
     type: "cosmetic",
     priceCoins: 500,
     priceGems: 0,
+    category: "avatar",
+    subtype: "expression",
+  },
+
+  // ---- HATS (work on all bodies!) ----
+  {
+    id: "hat_cap",
+    name: "Cap",
+    description: "Casual red baseball cap",
+    type: "cosmetic",
+    priceCoins: 500,
+    priceGems: 0,
+    category: "avatar",
+    subtype: "hat",
   },
   {
-    id: "skin_classic",
-    name: "Classic Skin",
+    id: "hat_bowler",
+    name: "Bowler Hat",
+    description: "Classy black bowler with red band",
     type: "cosmetic",
+    priceCoins: 800,
+    priceGems: 0,
+    category: "avatar",
+    subtype: "hat",
+  },
+  {
+    id: "hat_wizard",
+    name: "Wizard Hat",
+    description: "Magical starry wizard hat",
+    type: "cosmetic",
+    priceCoins: 1500,
+    priceGems: 0,
+    category: "avatar",
+    subtype: "hat",
+  },
+
+  // ---- HOME: core layout pieces (permanent, no passive) ----
+  {
+    id: "home_floor_basic",
+    name: "Basic Floor",
+    type: "home",
     priceCoins: 0,
-    priceGems: 5,
+    priceGems: 0,
+    category: "floor",
+    subtype: "base",
+    interaction: {
+      type: "flavor",
+      text: "Clean enough that you'd almost eat MateCoins off it.",
+    },
+  },
+  {
+    id: "home_rug_cozy",
+    name: "Cozy Rug",
+    type: "home",
+    priceCoins: 400,
+    priceGems: 0,
+    category: "floor",
+    subtype: "rug",
+    interaction: {
+      type: "flavor",
+      text: "Soft, warm, and suspiciously good at hiding crumbs.",
+    },
+  },
+  {
+    id: "home_sofa_simple",
+    name: "Simple Sofa",
+    type: "home",
+    priceCoins: 800,
+    priceGems: 0,
+    category: "furniture",
+    subtype: "seating",
+    interaction: {
+      type: "flavor",
+      text: "Your ProcrastiMate vows to be productive… right after this sit.",
+    },
+  },
+  {
+    id: "home_chair_gamer",
+    name: "Desk Chair",
+    type: "home",
+    priceCoins: 650,
+    priceGems: 0,
+    category: "furniture",
+    subtype: "chair",
+    interaction: {
+      type: "flavor",
+      text: "Ergonomic enough to almost justify another gaming session.",
+    },
+  },
+  {
+    id: "home_bed_single",
+    name: "Cozy Bed",
+    type: "home",
+    priceCoins: 1000,
+    priceGems: 0,
+    category: "furniture",
+    subtype: "bed",
+    interaction: {
+      type: "flavor",
+      text: "Sleep now, conquer your to-do list later. Probably.",
+    },
+  },
+  {
+    id: "home_tv_basic",
+    name: "Basic TV",
+    type: "home",
+    priceCoins: 900,
+    priceGems: 0,
+    category: "appliance",
+    subtype: "tv",
+    interaction: {
+      type: "flavor",
+      text: "Skies are golden; MateCoins are in the forecast all week.",
+    },
+  },
+  {
+    id: "home_desk_simple",
+    name: "Simple Desk",
+    type: "home",
+    priceCoins: 750,
+    priceGems: 0,
+    category: "furniture",
+    subtype: "desk",
+    interaction: {
+      type: "flavor",
+      text: "A perfectly good place to be productive… or to organize snacks.",
+    },
+  },
+  {
+    id: "home_plant_small",
+    name: "Small Plant",
+    type: "home",
+    priceCoins: 300,
+    priceGems: 0,
+    category: "decor",
+    subtype: "plant",
+    interaction: {
+      type: "flavor",
+      text: "It thrives on sunlight and your unresolved tasks.",
+    },
+  },
+  {
+    id: "home_lamp_corner",
+    name: "Corner Lamp",
+    type: "home",
+    priceCoins: 350,
+    priceGems: 0,
+    category: "decor",
+    subtype: "lamp",
+    interaction: {
+      type: "flavor",
+      text: "Adds +1 visibility and +10% odds of late-night ideas.",
+    },
   },
 
   // ---- business (kept for now; passive; not recommended for real-money sale) ----
@@ -247,7 +460,12 @@ export function buyItem(id, withCurrency = "coins") {
 
   // permanent items cannot be double-purchased
   const s = load();
-  if ((it.type === "cosmetic" || it.type === "business") && s.owned[id]) {
+  if (
+    (it.type === "cosmetic" ||
+      it.type === "business" ||
+      it.type === "home") &&
+    s.owned[id]
+  ) {
     return { ok: false, msg: "Already owned" };
   }
   if (withCurrency !== "coins") return { ok: false, msg: "Gems not supported" };
@@ -289,7 +507,7 @@ export function buyItem(id, withCurrency = "coins") {
   } else if (it.type === "city_size") {
     addCityExtraCells(it.citySizeDelta || 0);
   } else {
-    // Cosmetics/businesses: permanent ownership; prestige does not touch KEY_STATE.
+    // Cosmetics / businesses / home items: permanent ownership.
     s.owned[id] = true;
     save(s);
     emit("owned", { id });

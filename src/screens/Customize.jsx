@@ -1,114 +1,34 @@
 // FILE: src/screens/Customize.jsx
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useAvatar } from "../context/AvatarContext";
-import { listCatalog, isOwned } from "../modules/store";
+import Avatar, { BODY_STYLES, EXPRESSION_STYLES, HAT_STYLES } from "../components/Avatar";
+import { listCatalog, isOwned, buyItem, getStore } from "../modules/store";
+import { getWallet, spendMate, fmtMate } from "../modules/wallet";
 
-const DEV_UNLOCK_KEY = "pm_unlocks_v1";
-const AVATAR_PERSIST_KEY = "pm_avatar_v1";
-
-/* ---------- tiny dev unlock store (fallback only) ---------- */
-function readDevUnlocks() {
-  try {
-    const raw = JSON.parse(localStorage.getItem(DEV_UNLOCK_KEY) || "null") || {};
-    return {
-      hats: new Set(Array.isArray(raw.hats) ? raw.hats : []),
-      skins: new Set(Array.isArray(raw.skins) ? raw.skins : []),
-    };
-  } catch {
-    return { hats: new Set(), skins: new Set() };
-  }
-}
-function writeDevUnlocks(u) {
-  try {
-    localStorage.setItem(
-      DEV_UNLOCK_KEY,
-      JSON.stringify({ hats: [...u.hats], skins: [...u.skins] })
-    );
-  } catch {}
-}
-
-/* ---------- helpers ---------- */
-function catalogByKind() {
-  const all = listCatalog();
-  const hats = all.filter((i) => i.id.startsWith("hat_"));
-  const skins = all.filter((i) => i.id.startsWith("skin_"));
-  return { hats, skins };
-}
-
-function Pill({ children, selected, locked, onClick }) {
-  const base =
-    "min-w-[76px] justify-center px-3 py-1.5 rounded-md text-sm border font-medium transition-colors";
-  const unlocked =
-    "bg-stone-100 text-stone-900 border-stone-400 hover:bg-stone-200 " +
-    "dark:bg-stone-800 dark:text-stone-100 dark:border-stone-600 dark:hover:bg-stone-700";
-  const selectedCls =
-    "bg-amber-500 text-black border-amber-600 hover:brightness-110";
-  const lockedCls =
-    "bg-stone-300 text-stone-700 border-stone-500 cursor-not-allowed " +
-    "dark:bg-stone-800/60 dark:text-stone-400 dark:border-stone-700";
-
-  const cls = locked
-    ? `${base} ${lockedCls}`
-    : selected
-    ? `${base} ${selectedCls}`
-    : `${base} ${unlocked}`;
-
-  return (
-    <button
-      type="button"
-      className={cls}
-      disabled={locked}
-      aria-selected={!!selected}
-      onClick={onClick}
-    >
-      {children}
-    </button>
-  );
-}
-
-/* ---------- preview image loader (tolerant) ---------- */
-const IMG_CACHE = new Map();
-function loadImage(src) {
-  if (!src) return Promise.resolve(null);
-  if (IMG_CACHE.has(src)) return IMG_CACHE.get(src);
-  const p = new Promise((resolve) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = () => resolve(null); // tolerate missing art
-    img.src = src;
-  });
-  IMG_CACHE.set(src, p);
-  return p;
-}
-
-// map item id -> filename without prefix, e.g. "hat_cap" -> "cap"
-const stripPrefix = (id, prefix) => (id?.startsWith(prefix) ? id.slice(prefix.length) : id);
-
-/* ---------- screen ---------- */
 export default function Customize() {
-  const { equipped, equipHat, equipSkin } = useAvatar();
-  const cats = useMemo(catalogByKind, []);
-  const [tab, setTab] = useState("hats"); // hats | skins
+  const { avatar, setBody, setExpression, setHat, setCustomName, getRenameCost, getRenameCount } = useAvatar();
+  const [tab, setTab] = useState("bodies"); // "bodies" | "expressions" | "hats"
+  const [wallet, setWallet] = useState(getWallet());
+  const [store, setStore] = useState(getStore());
+  const [msg, setMsg] = useState("");
+  const [showRenameModal, setShowRenameModal] = useState(false);
+  const [renameInput, setRenameInput] = useState("");
 
-  // fallback dev unlocks
-  const [devUnlocks, setDevUnlocks] = useState(() => readDevUnlocks());
-  // force a refresh when store ownership changes
-  const [tick, setTick] = useState(0);
-
-  // ensure default skin visible (fallback)
+  // Poll wallet/store state
   useEffect(() => {
-    if (!isOwned("skin_classic") && !devUnlocks.skins.has("skin_classic")) {
-      const next = { hats: new Set(devUnlocks.hats), skins: new Set(devUnlocks.skins) };
-      next.skins.add("skin_classic");
-      setDevUnlocks(next);
-      writeDevUnlocks(next);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    const interval = setInterval(() => {
+      setWallet(getWallet());
+      setStore(getStore());
+    }, 1000);
+    return () => clearInterval(interval);
   }, []);
 
-  // listen for store changes
+  // Listen for store events
   useEffect(() => {
-    const refresh = () => setTick((n) => n + 1);
+    const refresh = () => {
+      setWallet(getWallet());
+      setStore(getStore());
+    };
     window.addEventListener("store:owned", refresh);
     window.addEventListener("store:purchase", refresh);
     return () => {
@@ -117,235 +37,368 @@ export default function Customize() {
     };
   }, []);
 
-  // local persistence for equipped (non-invasive: mirrors context)
-  useEffect(() => {
-    try {
-      if (equipped) localStorage.setItem(AVATAR_PERSIST_KEY, JSON.stringify(equipped));
-    } catch {}
-  }, [equipped?.hat, equipped?.skin]);
-
-  function devUnlock(kind, id) {
-    const next = { hats: new Set(devUnlocks.hats), skins: new Set(devUnlocks.skins) };
-    next[kind].add(id);
-    setDevUnlocks(next);
-    writeDevUnlocks(next);
-    setTick((n) => n + 1);
+  function showMsg(text) {
+    setMsg(text);
+    setTimeout(() => setMsg((prev) => (prev === text ? "" : prev)), 4000);
   }
 
-  function isUnlocked(kind, id) {
-    return isOwned(id) || (kind === "hats" ? devUnlocks.hats.has(id) : devUnlocks.skins.has(id));
+  // Get cosmetics from catalog
+  const cosmetics = listCatalog({ types: ["cosmetic"] });
+  const bodies = cosmetics.filter((i) => i.subtype === "body");
+  const expressions = cosmetics.filter((i) => i.subtype === "expression");
+  const hats = cosmetics.filter((i) => i.subtype === "hat");
+
+  const currentItems = tab === "bodies" ? bodies : tab === "expressions" ? expressions : hats;
+
+  function handleUnlock(item) {
+    const result = buyItem(item.id, "coins");
+    if (result.ok) {
+      showMsg(`Unlocked ${item.name}!`);
+      setWallet(getWallet());
+      setStore(getStore());
+      
+      // Auto-equip after purchase
+      if (tab === "bodies") setBody(item.id);
+      else if (tab === "expressions") setExpression(item.id);
+      else if (tab === "hats") setHat(item.id);
+    } else {
+      showMsg(result.msg || "Failed to unlock");
+    }
   }
 
-  function labelFor(item) {
-    return item.name || item.id.replaceAll("_", " ");
+  function handleEquip(item) {
+    if (tab === "bodies") {
+      setBody(item.id);
+      showMsg(`Switched to ${item.name}!`);
+    } else if (tab === "expressions") {
+      setExpression(item.id);
+      showMsg(`Equipped ${item.name}!`);
+    } else if (tab === "hats") {
+      setHat(item.id);
+      showMsg(`Equipped ${item.name}!`);
+    }
   }
 
-  /* ---------- canvas preview ---------- */
-  const canvasRef = useRef(null);
-  const SIZE = 160;
+  function handleRemoveHat() {
+    setHat(null);
+    showMsg("Removed hat");
+  }
 
-  useEffect(() => {
-    let cancelled = false;
+  function openRenameModal() {
+    setRenameInput(avatar.customName || "");
+    setShowRenameModal(true);
+  }
 
-    async function draw() {
-      const c = canvasRef.current;
-      if (!c) return;
-      const ctx = c.getContext("2d");
-      ctx.clearRect(0, 0, SIZE, SIZE);
+  function handleRename() {
+    const newName = renameInput.trim();
+    const cost = getRenameCost();
+    const coins = wallet?.coins ?? 0;
 
-      const isDark = document.documentElement.classList.contains("dark");
-      ctx.fillStyle = isDark ? "#111316" : "#f6f6f6";
-      ctx.fillRect(0, 0, SIZE, SIZE);
-
-      const baseSrc = "assets/avatar/base.png";
-      const skinName = stripPrefix(equipped?.skin ?? "skin_classic", "skin_");
-      const hatName  = stripPrefix(equipped?.hat ?? "", "hat_");
-      const skinSrc  = equipped?.skin ? `assets/avatar/skins/${skinName}.png` : null;
-      const hatSrc   = equipped?.hat  ? `assets/avatar/hats/${hatName}.png`  : null;
-
-      const [skinImg, baseImg, hatImg] = await Promise.all([
-        loadImage(skinSrc), loadImage(baseSrc), loadImage(hatSrc)
-      ]);
-      if (cancelled) return;
-
-      const drawImg = (img) => {
-        if (!img) return;
-        const scale = Math.min(SIZE / img.width, SIZE / img.height);
-        const w = Math.floor(img.width * scale);
-        const h = Math.floor(img.height * scale);
-        const x = Math.floor((SIZE - w) / 2);
-        const y = Math.floor((SIZE - h) / 2);
-        ctx.imageSmoothingEnabled = false;
-        ctx.drawImage(img, x, y, w, h);
-      };
-
-      if (skinImg) drawImg(skinImg);
-      else { ctx.fillStyle = "#94a3b8"; ctx.fillRect(0, SIZE - 36, SIZE, 36); }
-
-      if (baseImg) drawImg(baseImg);
-      else { ctx.fillStyle = "#1f2937"; ctx.fillRect(24, 24, SIZE - 48, SIZE - 48); }
-
-      if (hatImg) drawImg(hatImg);
-      else if (equipped?.hat) { ctx.fillStyle = "#f59e0b"; ctx.fillRect(0, 0, SIZE, 10); }
-
-      ctx.strokeStyle = isDark ? "#384252" : "#d1d5db";
-      ctx.lineWidth = 1;
-      ctx.strokeRect(0.5, 0.5, SIZE - 1, SIZE - 1);
+    // Validate name
+    if (!newName) {
+      showMsg("Please enter a name");
+      return;
     }
 
-    draw();
-    return () => { cancelled = true; };
-  }, [equipped?.hat, equipped?.skin, tick]);
+    if (newName.length > 20) {
+      showMsg("Name too long (max 20 characters)");
+      return;
+    }
+
+    // Check if player can afford
+    if (cost > 0 && coins < cost) {
+      showMsg(`Not enough coins! Need ${fmtMate(cost)} 🪙`);
+      return;
+    }
+
+    // Spend coins if not first rename
+    if (cost > 0) {
+      const spent = spendMate(cost, { k: "avatar_rename" });
+      if (!spent?.ok) {
+        showMsg("Failed to rename");
+        return;
+      }
+    }
+
+    // Apply rename
+    setCustomName(newName);
+    setShowRenameModal(false);
+    setWallet(getWallet());
+    
+    if (cost === 0) {
+      showMsg(`Named your ProcrastiMate "${newName}"! (First rename FREE)`);
+    } else {
+      showMsg(`Renamed to "${newName}" for ${fmtMate(cost)} 🪙`);
+    }
+  }
+
+  function handleResetName() {
+    setCustomName(null);
+    setShowRenameModal(false);
+    showMsg("Reset to default name");
+  }
+
+  const coins = wallet?.coins ?? 0;
+  const renameCost = getRenameCost();
+  const displayName = avatar.customName || BODY_STYLES[avatar.bodyId]?.name || "ProcrastiMate";
 
   return (
-    <div className="p-4 lg:p-6 text-stone-900 dark:text-stone-100" data-tick={tick}>
-      <div className="mb-4 flex items-center justify-between gap-3">
-        <h1 className="text-2xl font-bold flex items-center gap-2">
-          <span role="img" aria-label="customize">🎨</span>
-          <span className="text-stone-900 dark:text-stone-100">Customize</span>
-        </h1>
+    <div className="p-6 max-w-5xl mx-auto">
+      {/* Header */}
+      <header className="flex flex-col sm:flex-row sm:justify-between sm:items-center mb-6 gap-3">
+        <div>
+          <h1 className="text-2xl font-bold flex items-center gap-2">
+            🎨 Customize
+          </h1>
+          <p className="text-sm opacity-75 mt-1">
+            Personalize your ProcrastiMate
+          </p>
+        </div>
+        <div className="flex items-center gap-3">
+          <div className="px-3 py-2 rounded-lg border text-sm tabular-nums dark:border-neutral-700 dark:bg-neutral-800">
+            <div className="opacity-70 text-xs uppercase tracking-wide">
+              Mate Coins
+            </div>
+            <div className="font-semibold">{fmtMate(coins)} 🪙</div>
+          </div>
+        </div>
+      </header>
 
-        <div className="flex gap-2" role="tablist" aria-label="Customize tabs">
-          {["hats", "skins"].map((t) => (
+      {/* Main Layout: Preview + Items */}
+      <div className="grid lg:grid-cols-[320px_1fr] gap-6">
+        {/* Left: Preview Card */}
+        <div className="panel p-6 rounded-xl border dark:border-neutral-700 dark:bg-neutral-800 bg-white border-neutral-300">
+          <h2 className="text-lg font-bold mb-4">Preview</h2>
+          
+          {/* Large Avatar Display */}
+          <div className="flex justify-center mb-4">
+            <Avatar size="xl" />
+          </div>
+
+          {/* Name Display + Rename Button */}
+          <div className="mb-4 text-center">
+            <div className="text-2xl font-bold mb-2">{displayName}</div>
             <button
-              key={t}
-              onClick={() => setTab(t)}
-              className={`px-3 py-1.5 rounded-lg text-sm border font-medium transition-colors ${
-                tab === t
-                  ? "bg-amber-300 hover:bg-amber-400 text-black border-amber-500"
-                  : "bg-stone-200 text-stone-900 border-stone-400 hover:bg-stone-300 " +
-                    "dark:bg-stone-800 dark:text-stone-100 dark:border-stone-600 dark:hover:bg-stone-700"
-              }`}
-              aria-pressed={tab === t}
-              role="tab"
+              onClick={openRenameModal}
+              className="px-3 py-1.5 rounded-lg text-sm border border-amber-500 text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20 transition-colors"
             >
-              {t[0].toUpperCase() + t.slice(1)}
+              ✏️ Rename ({renameCost === 0 ? "FREE" : `${fmtMate(renameCost)} 🪙`})
             </button>
-          ))}
+          </div>
+
+          {/* Stats */}
+          <div className="text-sm text-center opacity-75 space-y-1">
+            <div>Body: {BODY_STYLES[avatar.bodyId]?.name || "Unknown"}</div>
+            <div>Expression: {EXPRESSION_STYLES[avatar.expressionId]?.name || "Unknown"}</div>
+            <div>Hat: {avatar.hatId ? HAT_STYLES[avatar.hatId]?.name : "None"}</div>
+          </div>
+        </div>
+
+        {/* Right: Wardrobe */}
+        <div className="panel p-6 rounded-xl border dark:border-neutral-700 dark:bg-neutral-800 bg-white border-neutral-300">
+          {/* Tabs */}
+          <div className="flex items-center gap-2 mb-4">
+            <button
+              onClick={() => setTab("bodies")}
+              className={`px-4 py-2 rounded-lg font-semibold transition-colors ${
+                tab === "bodies"
+                  ? "bg-amber-500 text-black"
+                  : "bg-neutral-200 dark:bg-neutral-700 text-neutral-900 dark:text-neutral-100 hover:bg-neutral-300 dark:hover:bg-neutral-600"
+              }`}
+            >
+              Bodies ({bodies.length})
+            </button>
+            <button
+              onClick={() => setTab("expressions")}
+              className={`px-4 py-2 rounded-lg font-semibold transition-colors ${
+                tab === "expressions"
+                  ? "bg-amber-500 text-black"
+                  : "bg-neutral-200 dark:bg-neutral-700 text-neutral-900 dark:text-neutral-100 hover:bg-neutral-300 dark:hover:bg-neutral-600"
+              }`}
+            >
+              Expressions ({expressions.length})
+            </button>
+            <button
+              onClick={() => setTab("hats")}
+              className={`px-4 py-2 rounded-lg font-semibold transition-colors ${
+                tab === "hats"
+                  ? "bg-amber-500 text-black"
+                  : "bg-neutral-200 dark:bg-neutral-700 text-neutral-900 dark:text-neutral-100 hover:bg-neutral-300 dark:hover:bg-neutral-600"
+              }`}
+            >
+              Hats ({hats.length})
+            </button>
+          </div>
+
+          {/* Remove Hat Button (only for hats tab) */}
+          {tab === "hats" && avatar.hatId && (
+            <div className="mb-4">
+              <button
+                onClick={handleRemoveHat}
+                className="px-4 py-2 rounded-lg text-sm border border-red-500 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
+              >
+                Remove Hat
+              </button>
+            </div>
+          )}
+
+          {/* Items Grid */}
+          <div className="grid gap-3">
+            {currentItems.map((item) => {
+              const owned = isOwned(item.id);
+              const equipped =
+                (tab === "bodies" && avatar.bodyId === item.id) ||
+                (tab === "expressions" && avatar.expressionId === item.id) ||
+                (tab === "hats" && avatar.hatId === item.id);
+              const price = item.priceCoins || 0;
+              const canAfford = coins >= price;
+
+              return (
+                <div
+                  key={item.id}
+                  className={`flex items-center gap-4 p-3 rounded-lg border transition-all ${
+                    equipped
+                      ? "border-amber-500 bg-amber-50 dark:bg-amber-900/20"
+                      : "border-neutral-300 dark:border-neutral-600 hover:border-neutral-400 dark:hover:border-neutral-500"
+                  }`}
+                >
+                  {/* Preview - FIX: Show current body with the item being previewed */}
+                  <div className="flex-shrink-0">
+                    <Avatar
+                      size="md"
+                      bodyId={tab === "bodies" ? item.id : avatar.bodyId}
+                      expressionId={tab === "expressions" ? item.id : (tab === "bodies" ? "expr_happy" : avatar.expressionId)}
+                      hatId={tab === "hats" ? item.id : (tab === "bodies" ? null : avatar.hatId)}
+                    />
+                  </div>
+
+                  {/* Info */}
+                  <div className="flex-1 min-w-0">
+                    <div className="font-semibold text-sm">{item.name}</div>
+                    {item.description && (
+                      <div className="text-xs opacity-60 mt-0.5">{item.description}</div>
+                    )}
+                    {price > 0 && !owned && (
+                      <div className="text-xs opacity-75 mt-0.5">
+                        {fmtMate(price)} 🪙
+                      </div>
+                    )}
+                    {price === 0 && !owned && (
+                      <div className="text-xs text-green-600 dark:text-green-400 mt-0.5">
+                        Free
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Action Button */}
+                  <div>
+                    {equipped ? (
+                      <div className="px-3 py-1.5 rounded-md bg-amber-500 text-black text-sm font-semibold">
+                        Equipped
+                      </div>
+                    ) : owned ? (
+                      <button
+                        onClick={() => handleEquip(item)}
+                        className="px-3 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white text-sm font-semibold transition-colors"
+                      >
+                        Equip
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => handleUnlock(item)}
+                        disabled={!canAfford}
+                        className={`px-3 py-1.5 rounded-md text-sm font-semibold transition-colors ${
+                          canAfford
+                            ? "bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white"
+                            : "bg-neutral-400 dark:bg-neutral-600 text-neutral-200 cursor-not-allowed"
+                        }`}
+                      >
+                        {price === 0 ? "Unlock" : `${fmtMate(price)} 🪙`}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </div>
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-2">
-        {/* Preview */}
-        <section className="panel p-4 rounded-xl shadow-sm">
-          <div className="text-sm font-semibold text-stone-900 dark:text-stone-100 mb-2">Preview</div>
-
-          <div className="rounded-md border border-stone-400 dark:border-stone-700 p-3 text-sm flex items-center justify-center">
-            <canvas
-              ref={canvasRef}
-              width={160}
-              height={160}
-              style={{ width: 160, height: 160, imageRendering: "pixelated", borderRadius: 8 }}
-              aria-label="Avatar preview"
-            />
-          </div>
-
-          <div className="mt-2 rounded-md border border-stone-400 dark:border-stone-700 p-3 text-sm">
-            <div className="font-semibold text-stone-900 dark:text-stone-100">Equipped</div>
-            <div className="mt-1 text-xs">
-              <span className="text-stone-900 dark:text-stone-100">
-                Hat: <b>{equipped?.hat ?? "none"}</b>
-              </span>
-              <span className="ml-3 text-stone-900 dark:text-stone-100">
-                Skin: <b>{equipped?.skin ?? "none"}</b>
-              </span>
-            </div>
-          </div>
-        </section>
-
-        {/* Loadout */}
-        <section className="panel p-4 rounded-xl shadow-sm">
-          <div className="text-sm font-semibold text-stone-900 dark:text-stone-100 mb-2">Loadout</div>
-
-          {/* Hats */}
-          <div className="rounded-xl border border-stone-400 dark:border-stone-700 p-3 mb-3">
-            <div className="text-sm font-semibold text-stone-900 dark:text-stone-100">Hats</div>
-            <div className="text-xs mt-0.5 mb-2 text-stone-800 dark:text-stone-300">
-              Unlock in Store. Tap to equip.
+      {/* Rename Modal */}
+      {showRenameModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white dark:bg-neutral-800 rounded-xl p-6 max-w-md w-full border dark:border-neutral-700">
+            <h3 className="text-xl font-bold mb-4">Name Your ProcrastiMate</h3>
+            
+            <div className="mb-4">
+              <input
+                type="text"
+                value={renameInput}
+                onChange={(e) => setRenameInput(e.target.value)}
+                placeholder="Enter a name..."
+                maxLength={20}
+                className="w-full px-3 py-2 rounded-lg border border-neutral-300 dark:border-neutral-600 dark:bg-neutral-700 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                autoFocus
+              />
+              <div className="text-xs opacity-60 mt-1">
+                {renameInput.length}/20 characters
+              </div>
             </div>
 
-            <div className="flex flex-wrap gap-2">
-              {(tab === "hats" ? cats.hats : []).map((h) => {
-                const unlocked = isUnlocked("hats", h.id);
-                const selected = equipped?.hat === h.id;
-                return (
-                  <div key={h.id} className="flex items-center gap-2">
-                    <Pill
-                      selected={selected}
-                      locked={!unlocked}
-                      onClick={() => unlocked && equipHat(h.id)}
-                    >
-                      {labelFor(h)}
-                    </Pill>
-
-                    {!unlocked && (
-                      <button
-                        type="button"
-                        onClick={() => devUnlock("hats", h.id)}
-                        className="px-2 py-1 text-xs rounded-md border
-                                   border-stone-400 text-stone-900 bg-stone-200 hover:bg-stone-300
-                                   dark:border-stone-600 dark:text-stone-100 dark:bg-stone-800 dark:hover:bg-stone-700"
-                        title="Dev unlock (temporary)"
-                      >
-                        Unlock
-                      </button>
-                    )}
-                  </div>
-                );
-              })}
-
-              {tab === "hats" && (
-                <Pill selected={!equipped?.hat} locked={false} onClick={() => equipHat(null)}>
-                  none
-                </Pill>
+            <div className="mb-4 text-sm opacity-75">
+              {renameCost === 0 ? (
+                <div className="text-green-600 dark:text-green-400 font-semibold">
+                  ✨ First rename is FREE!
+                </div>
+              ) : (
+                <div>
+                  Cost: {fmtMate(renameCost)} 🪙
+                  {coins < renameCost && (
+                    <div className="text-red-600 dark:text-red-400 mt-1">
+                      Not enough coins!
+                    </div>
+                  )}
+                </div>
               )}
             </div>
-          </div>
 
-          {/* Skins */}
-          <div className="rounded-xl border border-stone-400 dark:border-stone-700 p-3">
-            <div className="text-sm font-semibold text-stone-900 dark:text-stone-100">Skins</div>
-            <div className="text-xs mt-0.5 mb-2 text-stone-800 dark:text-stone-300">
-              Unlock in Store. Tap to equip.
-            </div>
-
-            <div className="flex flex-wrap gap-2">
-              {(tab === "skins" ? cats.skins : []).map((s) => {
-                const unlocked = isUnlocked("skins", s.id);
-                const selected = equipped?.skin === s.id;
-                return (
-                  <div key={s.id} className="flex items-center gap-2">
-                    <Pill
-                      selected={selected}
-                      locked={!unlocked}
-                      onClick={() => unlocked && equipSkin(s.id)}
-                    >
-                      {labelFor(s)}
-                    </Pill>
-
-                    {!unlocked && (
-                      <button
-                        type="button"
-                        onClick={() => devUnlock("skins", s.id)}
-                        className="px-2 py-1 text-xs rounded-md border
-                                   border-stone-400 text-stone-900 bg-stone-200 hover:bg-stone-300
-                                   dark:border-stone-600 dark:text-stone-100 dark:bg-stone-800 dark:hover:bg-stone-700"
-                        title="Dev unlock (temporary)"
-                      >
-                        Unlock
-                      </button>
-                    )}
-                  </div>
-                );
-              })}
+            <div className="flex gap-2">
+              <button
+                onClick={() => setShowRenameModal(false)}
+                className="flex-1 px-4 py-2 rounded-lg border border-neutral-300 dark:border-neutral-600 hover:bg-neutral-100 dark:hover:bg-neutral-700 transition-colors"
+              >
+                Cancel
+              </button>
+              {avatar.customName && (
+                <button
+                  onClick={handleResetName}
+                  className="flex-1 px-4 py-2 rounded-lg border border-orange-500 text-orange-600 dark:text-orange-400 hover:bg-orange-50 dark:hover:bg-orange-900/20 transition-colors"
+                >
+                  Reset
+                </button>
+              )}
+              <button
+                onClick={handleRename}
+                disabled={!renameInput.trim() || (renameCost > 0 && coins < renameCost)}
+                className={`flex-1 px-4 py-2 rounded-lg font-semibold transition-colors ${
+                  renameInput.trim() && (renameCost === 0 || coins >= renameCost)
+                    ? "bg-amber-500 hover:bg-amber-600 text-black"
+                    : "bg-neutral-400 dark:bg-neutral-600 text-neutral-200 cursor-not-allowed"
+                }`}
+              >
+                Confirm
+              </button>
             </div>
           </div>
+        </div>
+      )}
 
-          <div className="mt-3 text-xs text-stone-800 dark:text-stone-300">
-            GearGrid placeholder. Drag-and-drop slots will appear here.
-          </div>
-        </section>
-      </div>
+      {/* Feedback Message */}
+      {msg && (
+        <div className="fixed bottom-6 right-6 px-4 py-3 rounded-lg border shadow-lg bg-neutral-900 border-neutral-700 text-white text-sm animate-fadeIn">
+          {msg}
+        </div>
+      )}
     </div>
   );
 }

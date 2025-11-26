@@ -623,7 +623,7 @@ function amountFor(h) {
   }
 
   // micro-based coin entries (passive + direct micro deposits)
-  if (k === "micro_add" || k.includes("_micro") || k === "offline_catchup") {
+  if (k === "micro_add" || k.includes("_micro") || k === "offline_catchup" || k === "store_buy") {
     return `${toMate(h.amt)} 🪙`;
   }
 

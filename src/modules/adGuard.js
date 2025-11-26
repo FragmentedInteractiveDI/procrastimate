@@ -1,5 +1,6 @@
 // FILE: src/modules/adGuard.js
-// Enhanced ad guard: tiered ads + APB cooldown, with unified USD/coin logging.
+// Enhanced ad guard: tiered ads + cooldown-only ads (APB + Home Cleanup),
+// with unified USD/coin logging.
 
 import { applyBoost, canWatchAd, getTiers, getBoostTimes } from "./boost";
 import { depositMate, creditUsdReview } from "./wallet";
@@ -99,31 +100,43 @@ export async function watchAd(kind = 1) {
   const spam = antiSpamGate();
   if (!spam.ok) return spam;
 
-  const isCooldown = kind === "apb_cooldown";
+  const isApbCooldown = kind === "apb_cooldown";
+  const isHomeCleanup = kind === "home_cleanup";
+  const isCooldownOnly = isApbCooldown || isHomeCleanup;
+
   _busy = true;
 
   try {
     // Simulated ad latency
     await new Promise((r) => setTimeout(r, 800));
 
-    const cfg = resolveTierConfig(kind);
+    const cfg = resolveTierConfig(1); // Use Tier I config for cooldown ads
     const usdShare = Math.max(0, (cfg.usdGross || 0) * (cfg.sharePct || 0));
 
-    /* ---- APB cooldown ad (USD only) ---- */
-    if (isCooldown) {
+    /* ---- Cooldown-only ads (APB + Home Cleanup) ---- */
+    if (isCooldownOnly) {
       if (usdShare > 0) {
+        const offerId = isHomeCleanup ? "home_cleanup" : cfg.id;
+        const tier = isHomeCleanup ? "home_cleanup" : "apb_cooldown";
+        
         creditUsdReview(usdShare, {
           k: "ad_usd_share",
-          offerId: cfg.id,
+          offerId: offerId,
+          tier: tier,
           src: "ad",
-          coins: 0,
-          tier: kind,
         });
       }
       try {
         incAdsWatched(1);
       } catch {}
-      return { ok: true, mode: "cooldown_skip", usdShare };
+      
+      pushEvent(isHomeCleanup ? "home_cleanup" : "apb_cooldown");
+      
+      return {
+        ok: true,
+        mode: isHomeCleanup ? "home_cleanup_cd" : "cooldown_skip",
+        usdShare,
+      };
     }
 
     /* ---- Tiered ads (1 / 2 / 3) ---- */
@@ -141,13 +154,12 @@ export async function watchAd(kind = 1) {
     const baseCoins = cfg.baseCoins;
     const coins = Math.floor(baseCoins * Math.max(1, Number(mult) || 1));
 
-
-    // Deposit coins (no src: "ad" - let it log normally)
+    // Deposit coins (normal earn history — not tagged as ad here)
     if (coins > 0) {
       depositMate(coins, { tier: kind, offerId: cfg.id });
     }
 
-    // Credit USD share (WITH src: "ad" to prevent skim tracking)
+    // Credit USD share (tagged as ad so wallet can treat separately if needed)
     if (usdShare > 0) {
       creditUsdReview(usdShare, {
         k: "ad_usd_share",
@@ -160,6 +172,8 @@ export async function watchAd(kind = 1) {
     try {
       incAdsWatched(1);
     } catch {}
+
+    pushEvent(kind);
 
     return {
       ok: true,

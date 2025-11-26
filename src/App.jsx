@@ -2,10 +2,12 @@
 import "./setup/optionals.js"; // tolerant shims for membership/ads/gear
 
 import React, { useEffect, useState, useRef } from "react";
+import { AvatarProvider } from "./context/AvatarContext"; // ✨ NEW
+import Avatar from "./components/Avatar"; // ✨ NEW: For header avatar
+
 import Games from "./screens/Games.jsx";
 import Home from "./screens/Home.jsx";
-// import Store from "./screens/Store.jsx";   // REMOVED: merged into Shop
-import Shop from "./screens/Shop.jsx";        // Real-money + Mate spend (merged)
+import Shop from "./screens/Shop.jsx";
 import Payouts from "./screens/Payouts.jsx";
 import Settings from "./screens/Settings.jsx";
 import Customize from "./screens/Customize.jsx";
@@ -19,7 +21,7 @@ import MateBanner from "./components/MateBanner.jsx";
 import PWAControls from "./components/PWAControls.jsx";
 import SWDebugLogger from "./components/SWDebugLogger.jsx";
 import BetaBadge from "./components/BetaBadge.jsx";
-import ApbControls from "./components/ApbControls.jsx"; // compact APB UI in header
+import ApbControls from "./components/ApbControls.jsx";
 
 import { tickCityEconomy } from "./modules/cityEconomy";
 import {
@@ -50,17 +52,8 @@ function useInterval(fn, ms) {
   useEffect(() => { const id = setInterval(fn, ms); return () => clearInterval(id); }, [fn, ms]);
 }
 
-const DEFAULT_STATE = {
-  coins: 0,
-  premium: false,
-  owned: {},
-  equipped: { hat: null, skin: null },
-  ownedCosmetics: { hats: [], skins: [] },
-};
-
 export default function App() {
   const [dark, setDark] = useLocalState("pm_dark", true);
-  const [state, setState] = useLocalState("pm_state_v4", DEFAULT_STATE);
   const [tab, setTab] = useLocalState("pm_tab", "Payouts");
   const beta = isBetaMode();
 
@@ -104,9 +97,10 @@ export default function App() {
       "pm_state_v4","pm_dark","pm_tab",
       "pm_boost_v1","pm_boost_v2",
       "pm_wallet_v1","pm_wallet_v2",
-      "pm_store_v2","pm_home_v1",
+      "pm_store_v2","pm_store_v3","pm_home_v1",
       "pm_stats_v1","pm_stats_v2",
       "pm_history_v1","pm_payouts_v1",
+      "pm_avatar_v1", // ✨ NEW: reset avatar
       "ads.events","ads.reqs","ads.cooldownUntil","ads.suspiciousScore",
       "pm_city_income_v1","pm_city_income_carry_v1","pm_city_income_carry_micro_v1","pm_city_last_tick_v1",
       "pm_city_income_carry_v2","pm_city_last_tick_v2",
@@ -119,9 +113,9 @@ export default function App() {
     location.reload();
   }
 
-  // Tabs (Store removed)
+  // Tabs
   const MAIN_TABS = ["Payouts", "Shop", "Customize", "Settings"];
-  const GAME_ROUTES = ["City", "Build", "Parkour", "Home", "Missions"]; // dropdown
+  const GAME_ROUTES = ["City", "Build", "Parkour", "Home", "Missions"];
 
   useEffect(() => {
     const id = setInterval(() => tickCityEconomy(), 5000);
@@ -133,60 +127,43 @@ export default function App() {
   useEffect(() => { noteMutation("tab_change"); }, [tab]);
 
   return (
-    <div
-      className="min-h-screen transition-colors"
-      style={{ background: dark ? "#0b0b0b" : "#ffffff", color: dark ? "#fff" : "#111" }}
-    >
-      <HeaderBar
-        dark={dark}
-        beta={beta}
-        walletCoins={walletCoins}
-        boostText={boostText}
-        tab={tab}
-        setTab={setTab}
-        mainTabs={MAIN_TABS}
-        gameRoutes={GAME_ROUTES}
-        onToggleTheme={() => setDark((d) => !d)}
-      />
+    <AvatarProvider> {/* ✨ NEW: Wrap entire app in AvatarProvider */}
+      <div
+        className="min-h-screen transition-colors"
+        style={{ background: dark ? "#0b0b0b" : "#ffffff", color: dark ? "#fff" : "#111" }}
+      >
+        <HeaderBar
+          dark={dark}
+          beta={beta}
+          walletCoins={walletCoins}
+          boostText={boostText}
+          tab={tab}
+          setTab={setTab}
+          mainTabs={MAIN_TABS}
+          gameRoutes={GAME_ROUTES}
+          onToggleTheme={() => setDark((d) => !d)}
+        />
 
-      <main className="max-w-5xl mx-auto p-6">
-        {tab === "Missions" && <FragMissions dark={dark} />}
+        <main className="max-w-5xl mx-auto p-6">
+          {tab === "Missions" && <FragMissions dark={dark} />}
+          {tab === "Payouts" && <Payouts />}
+          {tab === "Shop" && <Shop />}
+          {tab === "Customize" && <Customize />} {/* ✨ UPDATED: Now uses AvatarContext */}
+          {tab === "Settings" && <Settings dark={dark} setDark={setDark} onResetAll={resetAll} />}
+          {tab === "Games" && <Games dark={dark} setTab={setTab} onToast={(m) => console.log(m)} />}
+          {tab === "City" && <City dark={dark} />}
+          {tab === "Build" && <CityBuilder dark={dark} />}
+          {tab === "Home" && <Home dark={dark} />}
+          {tab === "Parkour" && <Parkour dark={dark} />}
+        </main>
 
-        {tab === "Payouts" && <Payouts />}
-        {tab === "Shop" && <Shop />} {/* merged screen */}
-        {tab === "Customize" && (
-          <Customize
-            dark={dark}
-            equipped={state.equipped}
-            onEquip={(equipped) => { setState((s) => ({ ...s, equipped })); noteMutation("equip_change"); }}
-            owned={state.ownedCosmetics}
-            onUnlock={(type, id) => {
-              if (!state.ownedCosmetics[type]?.includes(id)) {
-                setState((s) => ({
-                  ...s,
-                  coins: s.coins - 25,
-                  ownedCosmetics: { ...s.ownedCosmetics, [type]: [...s.ownedCosmetics[type], id] },
-                }));
-                noteMutation("cosmetic_unlock");
-              }
-            }}
-          />
-        )}
-        {tab === "Settings" && <Settings dark={dark} setDark={setDark} onResetAll={resetAll} />}
+        <PWAControls />
+        {import.meta.env.DEV && <SWDebugLogger />}
 
-        {tab === "Games" && <Games dark={dark} setTab={setTab} onToast={(m) => console.log(m)} />}
-        {tab === "City" && <City dark={dark} />}
-        {tab === "Build" && <CityBuilder dark={dark} />}
-        {tab === "Home" && <Home dark={dark} />}
-        {tab === "Parkour" && <Parkour dark={dark} />}
-      </main>
-
-      <PWAControls />
-      {import.meta.env.DEV && <SWDebugLogger />}
-
-      <BoostHUD />
-      {!["City", "Tower Defense"].includes(tab) && <MateBanner equipped={state.equipped} />}
-    </div>
+        <BoostHUD />
+        {!["City", "Tower Defense"].includes(tab) && <MateBanner />}
+      </div>
+    </AvatarProvider>
   );
 }
 
@@ -220,13 +197,24 @@ function HeaderBar({ dark, beta, walletCoins, boostText, tab, setTab, mainTabs, 
           <div className="flex items-center gap-2 pl-2">
             <Badge icon="🪙" label={formatCoins(walletCoins)} dark={dark} />
             <Badge icon="" label={boostText} dark={dark} />
-            {/* compact APB controls beside Boost */}
             <div
               className="ml-1 px-2 py-0.5 rounded-full border"
               style={{ background: dark ? "#131313" : "#f8fafc", borderColor: dark ? "#303030" : "#e5e7eb" }}
             >
               <ApbControls compact />
             </div>
+            {/* Avatar button - click to open Customize */}
+            <button
+              onClick={() => setTab("Customize")}
+              className="ml-1 p-1 rounded-full border hover:border-amber-500 transition-colors"
+              style={{ 
+                background: dark ? "#131313" : "#f8fafc", 
+                borderColor: tab === "Customize" ? "#f59e0b" : (dark ? "#303030" : "#e5e7eb")
+              }}
+              title="Customize your ProcrastiMate"
+            >
+              <Avatar size="sm" expression="happy" />
+            </button>
           </div>
         </div>
 
