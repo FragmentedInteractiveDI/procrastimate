@@ -34,6 +34,12 @@ const TILESET = [
   { id: "park",       color: "#34d399", icon: "🌳" },
   { id: "shop",       color: "#60a5fa", icon: "🏬" },
   { id: "hq",         color: "#93c5fd", icon: "🏢" },
+
+  // new buildings
+  { id: "apb",        color: "#fb7185", icon: "🚓" },
+  { id: "bank",       color: "#eab308", icon: "🏦" },
+  { id: "garage",     color: "#38bdf8", icon: "🚗" },
+  { id: "paintshop",  color: "#f97316", icon: "🎨" },
 ];
 const PALETTE = Object.fromEntries(
   TILESET.map((t) => [t.id, { color: t.color, icon: t.icon }])
@@ -47,7 +53,17 @@ const normalizeId = (id) =>
 
 /* ---------- placement rules & costs ---------- */
 const ROADLIKE = new Set(["road", "avenue", "roundabout"]);
-const BUILDINGS = new Set(["home", "house", "park", "shop", "hq"]);
+const BUILDINGS = new Set([
+  "home",
+  "house",
+  "park",
+  "shop",
+  "hq",
+  "apb",
+  "bank",
+  "garage",
+  "paintshop",
+]);
 
 // Mate costs (per placement). Flat fee; tune as needed.
 // IMPORTANT: these only apply AFTER inventory for that tile is exhausted.
@@ -56,7 +72,7 @@ const COST_MATE = {
   avenue:     8,
   roundabout: 15,
   park:       6,
-  // buildings like house/home/shop/hq are currently free in Mate
+  // buildings like house/home/shop/hq/apb/bank/garage/paintshop are currently free in Mate
 };
 
 /* ---------- grid unlock model (for USD Store upgrades) ---------- */

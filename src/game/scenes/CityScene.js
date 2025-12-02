@@ -10,6 +10,7 @@ import {
 } from "../../modules/cityEconomy";
 import { isBoostActive, getBoostTimes, onChange as onBoostChange } from "../../modules/boost";
 import { addCoins } from "../../modules/wallet";
+import { loadCityAssets, getRoadTextureKey, getBuildingTextureKey, getRandomTrafficVehicle, textureExists } from "../../assets/cityAssets";
 
 let citySlots = null;
 try {
@@ -105,11 +106,25 @@ const APB_PB_KEY = "pm_apb_pb_v1";
 const APB_RAMP_SPAWNS_PER_SEC = 0.7;
 
 // —— U-turn hygiene ——
+// NOTE: this includes U-turns triggered when cars commit narrowly but then
+// must escape, not just pure cul-de-sac logic.
 const UTURN_COOLDOWN_SEC   = 2.0;
 const UTURN_MIN_PROGRESS   = 0.80;
 const NO_UTURN_NEAR_RB_CELLS = 1;
 
 // —— Personas ——
+// Aggressive drivers:
+//   - high speed multiplier
+//   - more likely to ignore yields
+//   - shorter follow gap
+//   - higher rear-end crash rate
+// Slow drivers:
+//   - low speed multiplier
+//   - never ignore yields
+//   - large follow gap
+//
+// All cars have a small chaosCrash chance that rises with APB intensity to
+// keep the city feeling "alive" and occasionally messy.
 const PERSONAS = {
   aggressive: { mult: 1.28, tint: 0xff6b6b, ignoreYield: 0.40, uturnCd: 1.0, chaosBias: 1.9, tex: "pm_diamond",
                 followGapPx: 7, rearendRate: 0.55, crashDistPx: 5 },
@@ -130,10 +145,17 @@ const CHAOS_CRASH_BASE = 0.020;
 
 // visuals
 const CAR_ROT_OFFSET = Math.PI / 2;
+// Muted ground / park colors so the city feels less “loud”
+const GRASS_TINT  = 0x4a5a3a;
+const GRASS_ALPHA = 0.9;
+const PARK_COLOR  = 0x225233;
 
 // helpers
 const vec = (x,y)=>new Phaser.Math.Vector2(x,y);
 const cellKey = (gx, gy) => `${gx},${gy}`;
+
+// Convert world coordinates (with PADDING) to worldLayer-relative coordinates
+const toLayerCoords = (worldX, worldY) => ({ x: worldX - PADDING, y: worldY - PADDING });
 
 // Bézier length (5-pt Gauss–Legendre)
 function quadLen(p0, p1, p2) {
@@ -213,7 +235,7 @@ function loadFromBuilderLS() {
 }
 function loadDefault() {
   const w = 12, h = 10;
-  const grid = Array.from({ length: h }, () => Array.from({ length: w }, () => "" ));
+  const grid = Array.from({ length: h }, () => Array.from({ length: w }, () => ""  ));
   grid[5][2] = "home";
   grid[5][3] = "r"; grid[5][4] = "r"; grid[6][4] = "r";
   grid[5][5] = "rb";
@@ -223,10 +245,10 @@ function loadDefault() {
 function loadActiveLayout(){ return loadFromSlots() || loadFromBuilderLS() || loadDefault(); }
 const safeHash = (sim) => JSON.stringify([sim?.slotId||"", sim?.w||0, sim?.h||0, sim?.grid?.[0]?.[0]||""]);
 
-// lane helpers
+// lane helpers - return grid-relative coordinates (for use with worldLayer)
 function lanePositionFor(gx, gy, dir, isRoundabout){
-  const cx = PADDING + gx*TILE + TILE/2;
-  const cy = PADDING + gy*TILE + TILE/2;
+  const cx = gx*TILE + TILE/2;  // Grid-relative (no PADDING)
+  const cy = gy*TILE + TILE/2;
   if (!isRoundabout) {
     if (Math.abs(dir.x) > 0) return { x: cx, y: cy + (dir.x > 0 ? +LANE_OFFSET : -LANE_OFFSET) };
     return { x: cx + (dir.y > 0 ? -LANE_OFFSET : +LANE_OFFSET), y: cy };
@@ -238,8 +260,8 @@ function lanePositionFor(gx, gy, dir, isRoundabout){
   return            { x: cx + ring, y: cy       };
 }
 function lanePointInCell(gx, gy, dir, t){
-  const baseX = PADDING + gx*TILE;
-  const baseY = PADDING + gy*TILE;
+  const baseX = gx*TILE;  // Grid-relative
+  const baseY = gy*TILE;
   if (Math.abs(dir.x) > 0){
     const laneY = lanePositionFor(gx, gy, dir, false).y;
     const x0 = dir.x > 0 ? baseX : baseX + TILE;
@@ -263,8 +285,8 @@ function laneSnapPoint(gx, gy, dir, x, y){
 }
 function entryPosition(gx, gy, newDir) {
   const inset = TILE * 0.18;
-  const baseX = PADDING + gx * TILE;
-  const baseY = PADDING + gy * TILE;
+  const baseX = gx * TILE;  // Grid-relative
+  const baseY = gy * TILE;
   if (Math.abs(newDir.x) > 0) {
     const x = newDir.x > 0 ? baseX + inset : baseX + TILE - inset;
     const y = lanePositionFor(gx, gy, newDir, false).y;
@@ -348,6 +370,9 @@ export default class CityScene extends Phaser.Scene {
 
     // feel helpers
     this.lastCarDir = new Phaser.Math.Vector2(1,0);
+
+    // tile sprite tracking for cleanup
+    this.tileSprites = [];
 
     // performance throttles
     this._mmDirty = true;
@@ -443,6 +468,10 @@ export default class CityScene extends Phaser.Scene {
   }
 
   preload(){
+    // ===== LOAD CITY PNG ASSETS =====
+    loadCityAssets(this);
+    
+    // ===== GENERATE TEMPORARY SPRITES FOR GAMEPLAY =====
     const g = this.make.graphics({ x: 0, y: 0, add: false });
 
     // player
@@ -506,16 +535,25 @@ export default class CityScene extends Phaser.Scene {
     this.fogGfx = this.add.graphics().setDepth(3);
     this.worldLayer.add([this.worldGfx, this.roadDetailGfx, this.fogGfx]);
 
-    // player + cop
+    // player + cop  
     const spawn = this.findStart() || { x: TILE, y: TILE };
-    this.car = this.add.image(PADDING + spawn.x + TILE/2, PADDING + spawn.y + TILE/2, "pm_car")
-      .setOrigin(0.5).setDepth(10).setVisible(true);
+
+    const carTextureKey = textureExists(this, "vehicle_player_compact_base")
+      ? "vehicle_player_compact_base"
+      : "pm_car";
+    const copTextureKey = textureExists(this, "vehicle_cop")
+      ? "vehicle_cop"
+      : "pm_cop";
+
+    // Grid-relative position (worldLayer's graphics handle PADDING)
+    this.car = this.add.image(spawn.x + TILE/2, spawn.y + TILE/2, carTextureKey)
+      .setOrigin(0.5).setDepth(100).setVisible(true).setScale(0.35);
     this.worldLayer.add(this.car);
 
-    this.cop = this.add.image(this.car.x, this.car.y, "pm_cop")
-      .setOrigin(0.5).setVisible(false).setDepth(9);
+    this.cop = this.add.image(this.car.x, this.car.y, copTextureKey)
+      .setOrigin(0.5).setVisible(false).setDepth(99).setScale(0.35);
     this.copRing = this.add.circle(this.cop.x, this.cop.y, 8, 0xff3355, 0.22)
-      .setStrokeStyle(2, 0xffc0c8, 0.9).setVisible(false).setDepth(8);
+      .setStrokeStyle(2, 0xffc0c8, 0.9).setVisible(false).setDepth(98);
     this.worldLayer.add([this.cop, this.copRing]);
 
     // camera follow + zoom
@@ -527,14 +565,28 @@ export default class CityScene extends Phaser.Scene {
     this.installZoomControls(worldCam);
 
     // HUD
-    this.helpTxt = this.add.text(PADDING, PADDING - 16,
+    this.helpTxt = this.add.text(
+      PADDING,
+      PADDING - 16,
       "City: SPACE to run APB. Arrows/WASD drive. Q/E zoom. M minimap.",
       { fontFamily: "monospace", fontSize: 12, color: "#aab2bc" }
     ).setScrollFactor(0);
-    this.hud = this.add.text(PADDING, PADDING - 32, "", {
-      fontFamily: "monospace", fontSize: 14, color: "#e8d08a",
-      backgroundColor: "rgba(27,31,35,0.25)", padding: { left: 6, right: 6, top: 3, bottom: 3 },
-    }).setScrollFactor(0);
+
+    this.hud = this.add.text(
+      this.scale.width / 2,
+      PADDING - 30,
+      "",
+      {
+        fontFamily: "monospace",
+        fontSize: 15,
+        color: "#ffe8a3",
+        backgroundColor: "rgba(0,0,0,0.82)",
+        padding: { left: 10, right: 10, top: 4, bottom: 4 },
+      }
+    )
+      .setOrigin(0.5, 0)
+      .setScrollFactor(0);
+
     this.uiLayer.add([this.helpTxt, this.hud]);
     this.updateCityHud();
     this.time.addEvent({ delay: 1000, loop: true, callback: () => this.updateCityHud() });
@@ -583,13 +635,15 @@ export default class CityScene extends Phaser.Scene {
         const { gx, gy } = this.pixToCell(this.car.x, this.car.y);
         r = { x: gx*TILE, y: gy*TILE };
       }
-      this.cop.setPosition(PADDING + r.x + TILE/2, PADDING + r.y + TILE/2).setVisible(true);
+      // Grid-relative position
+      this.cop.setPosition(r.x + TILE/2, r.y + TILE/2).setVisible(true);
       this.copRing.setPosition(this.cop.x, this.cop.y).setVisible(true);
       this.copRingTween?.stop();
       this.copRingTween = this.tweens.add({
         targets: this.copRing, scale: { from: 1, to: 1.25 }, alpha: { from: 0.28, to: 0.10 },
         duration: 700, yoyo: true, repeat: -1, ease: "Sine.easeInOut",
       });
+      this._refreshEntityDepths();
     };
     this.hideCop = () => { this.cop.setVisible(false); this.copRing.setVisible(false); this.copRingTween?.stop(); };
 
@@ -633,11 +687,41 @@ export default class CityScene extends Phaser.Scene {
     this._storageHandler = () => { this._needReload = true; };
     window.addEventListener("storage", this._storageHandler);
     this.time.addEvent({ delay: 250, loop: true, callback: () => this.reloadFromActiveLayout() });
-    this.scale.on("resize", (s) => { this.uiCam.setSize(s.width, s.height); this._mmDirty = true; this.drawMinimap(true); });
+
+    this.scale.on("resize", (s) => {
+      this.uiCam.setSize(s.width, s.height);
+
+      if (this.hud) {
+        this.hud.setPosition(s.width / 2, PADDING - 30);
+      }
+      if (this.helpTxt) {
+        this.helpTxt.setPosition(PADDING, PADDING - 16);
+      }
+
+      this._mmDirty = true;
+      this.drawMinimap(true);
+    });
 
     // debug toggle
     this._trafficDebug = false;
     this.input.keyboard.on("keydown-T", () => { this._trafficDebug = !this._trafficDebug; });
+  }
+
+  // Ensure entities are drawn above background tiles inside the container
+  _refreshEntityDepths() {
+    if (!this.worldLayer) return;
+
+    // traffic over tiles
+    if (this.traffic) {
+      for (const t of this.traffic) {
+        if (t?.spr) this.worldLayer.bringToTop(t.spr);
+      }
+    }
+
+    // cop ring, cop, then player on top
+    if (this.copRing) this.worldLayer.bringToTop(this.copRing);
+    if (this.cop) this.worldLayer.bringToTop(this.cop);
+    if (this.car) this.worldLayer.bringToTop(this.car);
   }
 
   _recalcSpeeds(){
@@ -702,7 +786,9 @@ export default class CityScene extends Phaser.Scene {
 
   countTiles(){
     const c={ road:0, avenue:0, roundabout:0, home:0, house:0, shop:0, park:0, hq:0, start:0 };
-    for(let y=0;y<this.h;y++) for(let x=0;x<this.w;x++){ const b=normBase(this.grid[y]?.[x]); if(c[b]!==undefined) c[b]+=1; }
+    for(let y=0;y<this.h;y++) for(let x=0;x<this.w;x++){
+      const b=normBase(this.grid[y]?.[x]); if(c[b]!==undefined) c[b]+=1;
+    }
     return c;
   }
 
@@ -738,6 +824,13 @@ export default class CityScene extends Phaser.Scene {
   // drawing
   drawWorld(){
     const g=this.worldGfx, dg=this.roadDetailGfx; if(!g||!dg) return;
+    
+    // CRITICAL: Destroy old tile sprites before creating new ones
+    if (this.tileSprites) {
+      this.tileSprites.forEach(sprite => sprite.destroy());
+    }
+    this.tileSprites = [];
+    
     g.clear(); dg.clear();
     for(let y=0;y<this.h;y++) for(let x=0;x<this.w;x++){
       const b=normBase(this.grid[y]?.[x]); const px=x*TILE, py=y*TILE;
@@ -758,6 +851,9 @@ export default class CityScene extends Phaser.Scene {
     for(let x=0;x<=this.w;x++) g.lineBetween(x*TILE,0,x*TILE,this.h*TILE);
     for(let y=0;y<=this.h;y++) g.lineBetween(0,y*TILE,this.w*TILE,y*TILE);
     this._mmDirty = true;
+
+    // After adding tiles, pull entities back to the top of the container
+    this._refreshEntityDepths();
   }
   isRoadTile(gx,gy){
     if (gy<0||gy>=this.h||gx<0||gx>=this.w) return false;
@@ -767,31 +863,136 @@ export default class CityScene extends Phaser.Scene {
   isRoundaboutCell(gx,gy){ return normBase(this.grid[gy]?.[gx])==="roundabout"; }
   drawRoadSmart(g,dg,gx,gy,avenue){
     const x=gx*TILE, y=gy*TILE;
-    g.fillStyle(avenue?0x2e2e2e:0x343434,1).fillRect(x,y,TILE,TILE);
-    g.lineStyle(1,0x222222,0.9).strokeRect(x+0.5,y+0.5,TILE-1,TILE-1);
+    
+    // Get neighbor information
     const nb=this.roadNeighbors(gx,gy);
-    if (nb.w && nb.e){ const ymid=y+TILE/2-1; dg.fillStyle(0xffffff,0.35); for(let i=x+2;i<x+TILE-6;i+=8) dg.fillRect(i,ymid,6,2); }
-    if (nb.n && nb.s){ const xmid=x+TILE/2-1; dg.fillStyle(0xffffff,0.35); for(let j=y+2;j<y+TILE-6;j+=8) dg.fillRect(xmid,j,2,6); }
-    if (avenue && nb.n && nb.s){ const xm=x+TILE/2-2; dg.fillStyle(0xfff3,0.22).fillRect(xm,y+2,4,TILE-4); }
+    
+    // Determine which road sprite to use based on connections
+    const tileId = avenue ? 'avenue' : 'road';
+    const textureKey = getRoadTextureKey(tileId, { n: nb.n, s: nb.s, e: nb.e, w: nb.w });
+    
+    // Draw the PNG sprite if available, otherwise fallback to old method
+    if (this.textures.exists(textureKey)) {
+      // Grid-relative position (worldLayer handles offset)
+      const sprite = this.add.image(x + TILE/2, y + TILE/2, textureKey);
+      sprite.setDisplaySize(TILE, TILE);
+      sprite.setDepth(1);
+      this.worldLayer.add(sprite); // Add to worldLayer for consistent zoom
+      this.tileSprites.push(sprite);
+    } else {
+      // Fallback to procedural graphics if PNG not loaded
+      g.fillStyle(avenue?0x2e2e2e:0x343434,1).fillRect(x,y,TILE,TILE);
+      g.lineStyle(1,0x222222,0.9).strokeRect(x+0.5,y+0.5,TILE-1,TILE-1);
+      if (nb.w && nb.e){ const ymid=y+TILE/2-1; dg.fillStyle(0xffffff,0.35); for(let i=x+2;i<x+TILE-6;i+=8) dg.fillRect(i,ymid,6,2); }
+      if (nb.n && nb.s){ const xmid=x+TILE/2-1; dg.fillStyle(0xffffff,0.35); for(let j=y+2;j<y+TILE-6;j+=8) dg.fillRect(xmid,j,2,6); }
+      if (avenue && nb.n && nb.s){ const xm=x+TILE/2-2; dg.fillStyle(0xfff3,0.22).fillRect(xm,y+2,4,TILE-4); }
+    }
   }
   drawRoundabout(g,dg,gx,gy){
-    const x=gx*TILE, y=gy*TILE, cx=x+TILE/2, cy=y+TILE/2;
-    g.fillStyle(0x343434,1).fillRect(x,y,TILE,TILE);
-    g.lineStyle(1,0x222222,0.9).strokeRect(x+0.5,y+0.5,TILE-1,TILE-1);
-    const rOuter=TILE*0.26, rInner=TILE*0.14;
-    dg.fillStyle(0x222326,1).fillCircle(cx,cy,rOuter);
-    dg.fillStyle(0x111215,1).fillCircle(cx,cy,rInner);
-    dg.lineStyle(1,0x2b2d31,0.9).strokeCircle(cx,cy,rOuter);
+    const x=gx*TILE, y=gy*TILE;
+    
+    // Draw the PNG sprite if available
+    if (this.textures.exists('road_roundabout')) {
+      const sprite = this.add.image(x + TILE/2, y + TILE/2, 'road_roundabout');
+      sprite.setDisplaySize(TILE, TILE);
+      sprite.setDepth(1);
+      this.worldLayer.add(sprite);
+      this.tileSprites.push(sprite);
+    } else {
+      // Fallback to procedural graphics
+      const cx=x+TILE/2, cy=y+TILE/2;
+      g.fillStyle(0x343434,1).fillRect(x,y,TILE,TILE);
+      g.lineStyle(1,0x222222,0.9).strokeRect(x+0.5,y+0.5,TILE-1,TILE-1);
+      const rOuter=TILE*0.26, rInner=TILE*0.14;
+      dg.fillStyle(0x222326,1).fillCircle(cx,cy,rOuter);
+      dg.fillStyle(0x111215,1).fillCircle(cx,cy,rInner);
+      dg.lineStyle(1,0x2b2d31,0.9).strokeCircle(cx,cy,rOuter);
+    }
   }
-  drawEmpty(g,x,y){ g.fillStyle(0x21252b,1).fillRect(x,y,TILE,TILE); }
-  drawPark(g,x,y){ g.fillStyle(0x2b8a3e,1).fillRect(x,y,TILE,TILE); }
-  drawHouse(g,x,y){ g.fillStyle(0x4a4a4a,1).fillRect(x,y,TILE,TILE); }
-  drawShop(g,x,y){ g.fillStyle(0x6078ff,1).fillRect(x,y,TILE,TILE); }
-  drawHQ(g,x,y){ g.fillStyle(0xb94b5e,1).fillRect(x,y,TILE,TILE); }
-  drawStart(g,x,y){ g.fillStyle(0xe2a23a,1).fillRect(x,y,TILE,TILE);
-    g.fillStyle(0x000000,0.25).fillTriangle(x+TILE*0.2,y+TILE*0.7, x+TILE*0.5,y+TILE*0.3, x+TILE*0.8,y+TILE*0.7); }
+  drawEmpty(g,x,y){ 
+    // Background ground: muted grass so it doesn’t overpower roads/buildings
+    if (this.textures.exists('terrain_grass')) {
+      const sprite = this.add.image(x + TILE/2, y + TILE/2, 'terrain_grass');
+      sprite.setDisplaySize(TILE, TILE);
+      sprite.setDepth(0);
+      sprite.setTint(GRASS_TINT);
+      sprite.setAlpha(GRASS_ALPHA);
+      this.worldLayer.add(sprite);
+      this.tileSprites.push(sprite);
+    } else {
+      // Slightly darker neutral fallback
+      g.fillStyle(0x181b20,1).fillRect(x,y,TILE,TILE); 
+    }
+  }
+  drawPark(g,x,y){ 
+    // Parks stay a touch richer, but still toned down from neon
+    g.fillStyle(PARK_COLOR,1).fillRect(x,y,TILE,TILE); 
+  }
+  drawHouse(g,x,y){ 
+    // Draw house building with 3/4 perspective
+    if (this.textures.exists('house_small')) {
+      const sprite = this.add.image(x + TILE/2, y + TILE, 'house_small');
+      sprite.setOrigin(0.5, 1.0);
+      
+      // Scale to fit width but maintain aspect ratio
+      const scale = TILE / 64;
+      sprite.setScale(scale);
+      
+      sprite.setDepth(5);
+      this.worldLayer.add(sprite);
+      this.tileSprites.push(sprite);
+    } else {
+      g.fillStyle(0x4a4a4a,1).fillRect(x,y,TILE,TILE); 
+    }
+  }
+  drawShop(g,x,y){ 
+    // Shop uses PNG when available, else colored placeholder
+    if (this.textures.exists("building_shop")) {
+      const sprite = this.add.image(x + TILE / 2, y + TILE, "building_shop");
+      sprite.setOrigin(0.5, 1.0);
+      const scale = TILE / 64;
+      sprite.setScale(scale);
+      sprite.setDepth(5);
+      this.worldLayer.add(sprite);
+      this.tileSprites.push(sprite);
+    } else {
+      g.fillStyle(0x6078ff,1).fillRect(x,y,TILE,TILE); 
+    }
+  }
+  drawHQ(g,x,y){ 
+    // HQ uses PNG when available, else colored placeholder
+    if (this.textures.exists("building_hq")) {
+      const sprite = this.add.image(x + TILE / 2, y + TILE, "building_hq");
+      sprite.setOrigin(0.5, 1.0);
+      const scale = TILE / 64;
+      sprite.setScale(scale);
+      sprite.setDepth(5);
+      this.worldLayer.add(sprite);
+      this.tileSprites.push(sprite);
+    } else {
+      g.fillStyle(0xb94b5e,1).fillRect(x,y,TILE,TILE); 
+    }
+  }
+  drawStart(g,x,y){ 
+    // Start tile uses house (player's home)
+    if (this.textures.exists('house_small')) {
+      const sprite = this.add.image(x + TILE/2, y + TILE, 'house_small');
+      sprite.setOrigin(0.5, 1.0);
+      
+      // Scale to fit width but maintain aspect ratio
+      const scale = TILE / 64;
+      sprite.setScale(scale);
+      
+      sprite.setDepth(5);
+      this.worldLayer.add(sprite);
+      this.tileSprites.push(sprite);
+    } else {
+      g.fillStyle(0xe2a23a,1).fillRect(x,y,TILE,TILE);
+      g.fillStyle(0x000000,0.25).fillTriangle(x+TILE*0.2,y+TILE*0.7, x+TILE*0.5,y+TILE*0.3, x+TILE*0.8,y+TILE*0.7); 
+    }
+  }
 
-  pixToCell(px,py){ return { gx: Math.floor((px-PADDING)/TILE), gy: Math.floor((py-PADDING)/TILE) }; }
+  pixToCell(px,py){ return { gx: Math.floor(px/TILE), gy: Math.floor(py/TILE) }; }
   isInsideGrid(gx,gy){ return gx>=0 && gy>=0 && gx<this.w && gy<this.h; }
   isRoadCell(gx,gy){ return this.isInsideGrid(gx,gy) && this.drive[gy][gx]; }
   isRoadPixel(px,py){ const {gx,gy}=this.pixToCell(px,py); return this.isRoadCell(gx,gy); }
@@ -820,27 +1021,56 @@ export default class CityScene extends Phaser.Scene {
   circulateTurn(d){ return (TRAFFIC_SIDE==="right") ? this.turnLeft(d) : this.turnRight(d); }
   exitTurn(d){ return (TRAFFIC_SIDE==="right") ? this.turnRight(d) : this.turnLeft(d); }
 
-  cornerControl(gx, gy, _fromDir, toDir){
-    const round = this.isRoundaboutCell(gx, gy);
-    const cx = PADDING + gx*TILE + TILE/2;
-    const cy = PADDING + gy*TILE + TILE/2;
-    if (round) return { x: cx, y: cy };
-    const edgeX = (toDir.x!==0) ? PADDING + (gx + (toDir.x>0?1:0)) * TILE : cx;
-    const edgeY = (toDir.y!==0) ? PADDING + (gy + (toDir.y>0?1:0)) * TILE : cy;
-    return { x: edgeX, y: edgeY };
+  // NEW: corner control point based on lane intersection (no diagonal slicing)
+  cornerControl(from, to, fromDir, toDir) {
+    // from: point on incoming lane
+    // to:   entry point on outgoing lane
+    // For a 90° turn, use intersection of incoming lane Y with outgoing lane X
+    if (Math.abs(fromDir.x) > 0 && Math.abs(toDir.y) > 0) {
+      // coming horizontally, leaving vertically
+      return { x: to.x, y: from.y };
+    }
+    if (Math.abs(fromDir.y) > 0 && Math.abs(toDir.x) > 0) {
+      // coming vertically, leaving horizontally
+      return { x: from.x, y: to.y };
+    }
+
+    // Fallback (straight or weird) – midpoint
+    return {
+      x: (from.x + to.x) * 0.5,
+      y: (from.y + to.y) * 0.5,
+    };
   }
+
   cellProgress(dir, x, y, baseX, baseY) {
     if (Math.abs(dir.x) > 0) return dir.x > 0 ? (x - baseX) / TILE : ((baseX + TILE) - x) / TILE;
     return dir.y > 0 ? (y - baseY) / TILE : ((baseY + TILE) - y) / TILE;
   }
+
+  // UPDATED: use from/to lane points for the corner control
   startBezierTurn(t, cNow, chooseDir, dstCell, nowSec, progInCell=0.7){
     const sClamped = Math.max(0.06, Math.min(0.95, progInCell));
+
+    // Incoming lane point (current cell, near exit edge)
     const from = lanePointInCell(cNow.gx, cNow.gy, t.dir, sClamped);
-    const ctrl = this.cornerControl(cNow.gx, cNow.gy, t.dir, chooseDir);
+
+    // Outgoing lane entry point (next cell)
     const to   = entryPosition(dstCell.x, dstCell.y, chooseDir);
+
+    // Control point at intersection of lane centerlines to avoid diagonal cuts
+    const ctrl = this.cornerControl(from, to, t.dir, chooseDir);
+
     const len  = quadLen(from, ctrl, to) || TILE;
     this.reserveLane(dstCell.x, dstCell.y, chooseDir, nowSec + RESERVE_SEC);
-    t.turn = { s:0, from, ctrl, to, len, newDir:{x:chooseDir.x,y:chooseDir.y}, dst:{x:dstCell.x,y:dstCell.y} };
+    t.turn = {
+      s: 0,
+      from,
+      ctrl,
+      to,
+      len,
+      newDir: { x: chooseDir.x, y: chooseDir.y },
+      dst: { x: dstCell.x, y: dstCell.y }
+    };
   }
 
   // ——— U-turn helpers ———
@@ -851,8 +1081,8 @@ export default class CityScene extends Phaser.Scene {
     const from = lanePointInCell(cNow.gx, cNow.gy, dir, sClamped);
 
     const center = {
-      x: PADDING + cNow.gx*TILE + TILE/2,
-      y: PADDING + cNow.gy*TILE + TILE/2
+      x: cNow.gx*TILE + TILE/2,  // Grid-relative
+      y: cNow.gy*TILE + TILE/2
     };
     const to   = entryPosition(cNow.gx, cNow.gy, this.reverseDir(dir));
 
@@ -871,6 +1101,8 @@ export default class CityScene extends Phaser.Scene {
   }
 
   // —— NEW: local tests for safe U-turns ——
+// True cul-de-sac detection: we only allow U-turn if the car is
+// effectively boxed in and not next to a roundabout shortcut.
   isRoundaboutNeighbor(gx, gy){
     for (let dx=-NO_UTURN_NEAR_RB_CELLS; dx<=NO_UTURN_NEAR_RB_CELLS; dx++){
       for (let dy=-NO_UTURN_NEAR_RB_CELLS; dy<=NO_UTURN_NEAR_RB_CELLS; dy++){
@@ -932,8 +1164,8 @@ export default class CityScene extends Phaser.Scene {
 
     const scored = [];
     for (const s of starts) {
-      const px = PADDING + s.gx*TILE + TILE/2;
-      const py = PADDING + s.gy*TILE + TILE/2;
+      const px = s.gx*TILE + TILE/2;  // Grid-relative
+      const py = s.gy*TILE + TILE/2;
       const inView = marginRect.contains(px, py);
       const farFromPlayer = Phaser.Math.Distance.Between(px, py, car.x, car.y) > PLAYER_SPAWN_AVOID_RADIUS;
       const score = (inView ? 0 : 2) + (farFromPlayer ? 1 : 0);
@@ -968,14 +1200,25 @@ export default class CityScene extends Phaser.Scene {
     const P = PERSONAS[kind];
 
     const pos = lanePositionFor(cell.gx, cell.gy, dir, this.isRoundaboutCell(cell.gx, cell.gy));
-    const spr = this.add.image(pos.x, pos.y, P.tex)
+
+    const vehicleKey = this.textures.exists("vehicle_sedan")
+      ? getRandomTrafficVehicle()
+      : P.tex;
+
+    const spr = this.add.image(pos.x, pos.y, vehicleKey)
       .setTint(this.apb ? 0xffea76 : P.tint)
-      .setDepth(4).setAlpha(0.95);
+      .setDepth(4).setAlpha(0.95).setScale(0.25);
+
+    // Initial orientation matches travel direction (cardinal only)
+    if (dir && (dir.x || dir.y)) {
+      spr.setRotation(this.angleForDir(dir));
+    }
+
     this.worldLayer.add(spr);
 
     // store per-car traits
     this.traffic.push({
-      spr, dir, wait:0, inRound:false, laps:0, lastKey:"", turn:null,
+      spr, dir, wait:0, inRound:false, rbCell:null, laps:0, lastKey:"", turn:null,
       lastUTurnAt: -999, justExitedRBUntil: 0,
       kind,
       speedMult: P.mult,
@@ -988,6 +1231,17 @@ export default class CityScene extends Phaser.Scene {
       chaosHoldCellKey: "", // prevents turning in this cell once triggered
     });
     this.markLanePass(cell.gx, cell.gy, dir, nowSec);
+
+    // Ensure new traffic doesn't get buried by later tiles
+    this._refreshEntityDepths();
+  }
+
+
+  angleForDir(dir){
+    const dx = (dir && typeof dir.x === "number") ? dir.x : 0;
+    const dy = (dir && typeof dir.y === "number") ? dir.y : 0;
+    if (!dx && !dy) return 0;
+    return Phaser.Math.Angle.Between(0, 0, dx, dy) + CAR_ROT_OFFSET;
   }
 
   roadOrientation(gx,gy){
@@ -1000,11 +1254,11 @@ export default class CityScene extends Phaser.Scene {
 
   edgePosition(gx, gy, newDir){
     if (Math.abs(newDir.x) > 0) {
-      const x = PADDING + (gx + (newDir.x > 0 ? 1 : 0)) * TILE;
+      const x = (gx + (newDir.x > 0 ? 1 : 0)) * TILE;  // Grid-relative
       const y = lanePositionFor(gx, gy, newDir, this.isRoundaboutCell(gx, gy)).y;
       return { x, y };
     } else {
-      const y = PADDING + (gy + (newDir.y > 0 ? 1 : 0)) * TILE;
+      const y = (gy + (newDir.y > 0 ? 1 : 0)) * TILE;
       const x = lanePositionFor(gx, gy, newDir, this.isRoundaboutCell(gx, gy)).x;
       return { x, y };
     }
@@ -1061,6 +1315,9 @@ export default class CityScene extends Phaser.Scene {
   }
 
   // —— tailgating helpers ——
+// Cars will slow/stop when following another car too closely on the same lane,
+// with persona-dependent follow distance and a small probability of rear-end
+// collisions under tight spacing.
   _carAheadSameLane(t){
     const meX = t.spr.x, meY = t.spr.y;
     const horiz = Math.abs(t.dir.x) > 0;
@@ -1138,6 +1395,11 @@ export default class CityScene extends Phaser.Scene {
       const t=this.traffic[i];
       if (t.wait>0){ t.wait-=dt; continue; }
 
+      // Keep sprite rotation aligned with its current travel direction (cardinal)
+      if (t.dir && (t.dir.x || t.dir.y)) {
+        t.spr.setRotation(this.angleForDir(t.dir));
+      }
+
       if (this.apb && this.time.now >= this._nextFlickerAt) {
         t.spr.setAlpha(0.85 + 0.1*Math.sin(this.time.now*0.02));
       } else if (!this.apb) {
@@ -1155,6 +1417,10 @@ export default class CityScene extends Phaser.Scene {
         const y = u*u*t.turn.from.y + 2*u*s*t.turn.ctrl.y + s*s*t.turn.to.y;
         t.spr.setPosition(x, y);
 
+        // Update rotation immediately during the turn based on new direction
+        const angle = Phaser.Math.Angle.Between(0, 0, t.turn.newDir.x, t.turn.newDir.y);
+        t.spr.setRotation(angle + CAR_ROT_OFFSET);
+
         if (t.turn.s >= 1){
           this.markLanePass(t.turn.dst.x, t.turn.dst.y, t.turn.newDir, nowSec);
           t.dir.set(t.turn.newDir.x, t.turn.newDir.y);
@@ -1165,8 +1431,55 @@ export default class CityScene extends Phaser.Scene {
       }
 
       const cNow = this.pixToCell(t.spr.x, t.spr.y);
-      const baseX = PADDING + cNow.gx*TILE, baseY = PADDING + cNow.gy*TILE;
+      const baseX = cNow.gx*TILE, baseY = cNow.gy*TILE;  // Grid-relative
       const prog  = this.cellProgress(t.dir, t.spr.x, t.spr.y, baseX, baseY);
+
+      // ROUNDABOUT HANDLING WITH STABLE CELL
+      const inRbCellNow = this.isRoundaboutCell(cNow.gx, cNow.gy) || (t.inRound && t.rbCell);
+      if (inRbCellNow) {
+        // Lock to the first roundabout cell we detected so we don't jitter between cells
+        if (!t.inRound || !t.rbCell) {
+          t.inRound = true;
+          t.rbCell = { gx: cNow.gx, gy: cNow.gy };
+        }
+        const rb = t.rbCell;
+
+        const right = this.exitTurn(t.dir);
+        const gxExit = rb.gx + right.x, gyExit = rb.gy + right.y;
+
+        const exitHasRoad = this.isRoadCell(gxExit, gyExit) && !this.isRoundaboutCell(gxExit, gyExit);
+        const exitClear   = exitHasRoad && this.canEnterLane(gxExit, gyExit, right, nowSec);
+        const gxFar = gxExit + right.x, gyFar = gyExit + right.y;
+        const farOk = this.isRoadCell(gxFar, gyFar);
+
+        const mustExit = t.laps >= ROUND_MAX_LAPS;
+        const readyExit = exitClear && (t.laps >= ROUND_MIN_LAPS) && (farOk || Math.random()<0.25);
+
+        if (exitClear && (mustExit || readyExit)) {
+          t.dir.set(right.x, right.y);
+          const posExit = lanePositionFor(gxExit, gyExit, t.dir, this.isRoundaboutCell(gxExit, gyExit));
+          t.spr.setPosition(posExit.x, posExit.y);
+          this.markLanePass(gxExit, gyExit, t.dir, nowSec);
+          t.inRound = false;
+          t.rbCell = null;
+          t.laps = 0;
+          t.wait = 0.08;
+          t.justExitedRBUntil = this.time.now/1000 + 0.8;
+          continue;
+        }
+
+        const r = this.circulateTurn(t.dir);
+        t.dir.set(r.x, r.y);
+        const pos = lanePositionFor(rb.gx, rb.gy, t.dir, true);
+        t.spr.setPosition(pos.x, pos.y);
+        t.wait = 0.06;
+        t.laps += ROUND_STEP;
+        continue;
+      }
+
+      // non-roundabout logic
+      t.inRound = false;
+      t.rbCell = null;
 
       if (!this.isRoundaboutCell(cNow.gx, cNow.gy)) {
         const leftD = this.turnLeft(t.dir);
@@ -1249,41 +1562,9 @@ export default class CityScene extends Phaser.Scene {
 
       const cNext = this.pixToCell(nx, ny);
 
-      if (this.isRoundaboutCell(cNow.gx, cNow.gy)) {
-        t.inRound = true;
-        const right = this.exitTurn(t.dir);
-        const gxExit = cNow.gx + right.x, gyExit = cNow.gy + right.y;
-
-        const exitHasRoad = this.isRoadCell(gxExit, gyExit) && !this.isRoundaboutCell(gxExit, gyExit);
-        const exitClear   = exitHasRoad && this.canEnterLane(gxExit, gyExit, right, nowSec);
-        const gxFar = gxExit + right.x, gyFar = gyExit + right.y;
-        const farOk = this.isRoadCell(gxFar, gyFar);
-
-        const mustExit = t.laps >= ROUND_MAX_LAPS;
-        const readyExit = exitClear && (t.laps >= ROUND_MIN_LAPS) && (farOk || Math.random()<0.25);
-
-        if (exitClear && (mustExit || readyExit)) {
-          t.dir.set(right.x, right.y);
-          const posExit = lanePositionFor(gxExit, gyExit, t.dir, this.isRoundaboutCell(gxExit, gyExit));
-          t.spr.setPosition(posExit.x, posExit.y);
-          this.markLanePass(gxExit, gyExit, t.dir, nowSec);
-          t.inRound = false; t.laps = 0; t.wait = 0.08;
-          t.justExitedRBUntil = this.time.now/1000 + 0.8;
-          continue;
-        }
-
-        const r = this.circulateTurn(t.dir);
-        t.dir.set(r.x, r.y);
-        const pos = lanePositionFor(cNow.gx, cNow.gy, t.dir, true);
-        t.spr.setPosition(pos.x, pos.y);
-        t.wait = 0.06;
-        t.laps += ROUND_STEP;
-        continue;
-      }
-
       // persona chaos: crash if overshoot into dead end
       const fwdCell = { x: cNow.gx + t.dir.x, y: cNow.gy + t.dir.y };
-      if (!this.isRoadCell(fwdCell.x, fwdCell.y) && this.isRoadPixel(t.spr.x, t.spr.y) && this.cellProgress(t.dir, t.spr.x, t.spr.y, PADDING + cNow.gx*TILE, PADDING + cNow.gy*TILE) > 0.92) {
+      if (!this.isRoadCell(fwdCell.x, fwdCell.y) && this.isRoadPixel(t.spr.x, t.spr.y) && this.cellProgress(t.dir, t.spr.x, t.spr.y, cNow.gx*TILE, cNow.gy*TILE) > 0.92) {
         this.spawnCrash(t.spr.x, t.spr.y);
         t.spr.destroy();
         this.traffic.splice(i,1);
@@ -1365,6 +1646,9 @@ export default class CityScene extends Phaser.Scene {
       }
     }
     if (this.apb) this._nextFlickerAt = this.time.now + (1000/this._flickerHz);
+
+    // Keep entities on top as traffic changes
+    this._refreshEntityDepths();
   }
 
   // ——— APB cop routing helpers ———
@@ -1376,7 +1660,7 @@ export default class CityScene extends Phaser.Scene {
     this._copStallSec = 0;
     this._copLastSeenCar = { x: this.car.x, y: this.car.y };
   }
-  _centerOf(gx,gy){ return { x: PADDING + gx*TILE + TILE/2, y: PADDING + gy*TILE + TILE/2 }; }
+  _centerOf(gx,gy){ return { x: gx*TILE + TILE/2, y: gy*TILE + TILE/2 }; }  // Grid-relative
   _planRouteToCar(){
     const start = this.pixToCell(this.cop.x, this.cop.y);
     const goal  = this.pixToCell(this.car.x, this.car.y);
@@ -1411,6 +1695,10 @@ export default class CityScene extends Phaser.Scene {
       const nx=this.cop.x+v.x, ny=this.cop.y+v.y;
       if (this.isRoadPixel(nx,this.cop.y)) this.cop.x=nx;
       if (this.isRoadPixel(this.cop.x,ny)) this.cop.y=ny;
+      
+      // Update cop rotation to face movement direction
+      const angle = Phaser.Math.Angle.Between(0, 0, v.x, v.y);
+      this.cop.setRotation(angle + CAR_ROT_OFFSET);
     }
     return true;
   }
@@ -1439,7 +1727,7 @@ export default class CityScene extends Phaser.Scene {
       let nx=this.car.x+v.x, ny=this.car.y+v.y;
 
       if (this.isRoadPixel(nx,ny)){ this.car.x=nx; this.car.y=ny; }
-      else { if (this.isRoadPixel(nx,this.car.y)) this.car.x=nx; if (this.isRoadPixel(this.car.x,ny)) this.car.y=ny; }
+      else { if (this.isRoadPixel(nx,this.car.x)) this.car.x=nx; if (this.isRoadPixel(this.car.x,ny)) this.car.y=ny; }
 
       this.lastCarDir.set(Math.sign(v.x||0), Math.sign(v.y||0));
       const ang = Phaser.Math.Angle.Between(0,0,v.x,v.y);
@@ -1461,6 +1749,9 @@ export default class CityScene extends Phaser.Scene {
       }
       this.revealAtCurrentCell(false);
       this._mmDirty = true;
+
+      // Keep player on top as it moves (just in case)
+      this._refreshEntityDepths();
     }
 
     // APB loop with routing
@@ -1500,6 +1791,10 @@ export default class CityScene extends Phaser.Scene {
           const nx=this.cop.x+chase.x, ny=this.cop.y+chase.y;
           if (this.isRoadPixel(nx,this.cop.y)) this.cop.x=nx;
           if (this.isRoadPixel(this.cop.x,ny)) this.cop.y=ny;
+          
+          // Update cop rotation to face chase direction
+          const angle = Phaser.Math.Angle.Between(0, 0, chase.x, chase.y);
+          this.cop.setRotation(angle + CAR_ROT_OFFSET);
         }
       }
 
@@ -1673,10 +1968,14 @@ export default class CityScene extends Phaser.Scene {
 
     this.drawWorld();
     const spawn=this.findStart()||{x:TILE,y:TILE};
-    this.car.setPosition(PADDING+spawn.x+TILE/2, PADDING+spawn.y+TILE/2).setDepth(10).setVisible(true);
+    // Grid-relative position, maintain high depth
+    this.car.setPosition(spawn.x+TILE/2, spawn.y+TILE/2).setDepth(100).setVisible(true);
     if (this.apb) this.spawnCop?.();
     this.updateCityHud(); this.drawFog(); this.revealAtCurrentCell(true);
     this._mmDirty = true; this.drawMinimap(true);
+
+    // Make sure ordering is still correct after reload
+    this._refreshEntityDepths();
   }
 
   // fx + summary
