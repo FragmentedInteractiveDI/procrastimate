@@ -11,6 +11,11 @@ import {
 import { isBoostActive, getBoostTimes, onChange as onBoostChange } from "../../modules/boost";
 import { addCoins } from "../../modules/wallet";
 import { loadCityAssets, getRoadTextureKey, getBuildingTextureKey, getRandomTrafficVehicle, textureExists } from "../../assets/cityAssets";
+import { GridSystem, lanePositionFor } from "./systems/GridSystem.js";
+import { RevealSystem } from "./systems/RevealSystem.js";
+import { NavigationSystem, lanePointInCell, laneSnapPoint, entryPosition, turnType } from "./systems/NavigationSystem.js";
+import { RenderSystem } from "./systems/RenderSystem.js";
+import { TrafficSystem } from "./systems/TrafficSystem.js";
 
 let citySlots = null;
 try {
@@ -31,13 +36,13 @@ const TILE = 28;
 const PADDING = 40;
 
 // speeds
-const CAR_SPEED_IDLE  = 110;
-const CAR_SPEED_BOOST = 160;
-const CAR_SPEED_STACK = 180;
+const CAR_SPEED_IDLE  = 75;  // Reduced from 110
+const CAR_SPEED_BOOST = 85; // Reduced from 160
+const CAR_SPEED_STACK = 105; // Reduced from 180
 
-const COP_SPEED_IDLE  = 90;
-const COP_SPEED_BOOST = 130;
-const COP_SPEED_STACK = 150;
+const COP_SPEED_IDLE  = 60;  // Reduced from 90
+const COP_SPEED_BOOST = 80;  // Reduced from 130
+const COP_SPEED_STACK = 95; // Reduced from 150
 
 // traffic
 const TRAFFIC_MAX = 10;
@@ -246,63 +251,9 @@ function loadActiveLayout(){ return loadFromSlots() || loadFromBuilderLS() || lo
 const safeHash = (sim) => JSON.stringify([sim?.slotId||"", sim?.w||0, sim?.h||0, sim?.grid?.[0]?.[0]||""]);
 
 // lane helpers - return grid-relative coordinates (for use with worldLayer)
-function lanePositionFor(gx, gy, dir, isRoundabout){
-  const cx = gx*TILE + TILE/2;  // Grid-relative (no PADDING)
-  const cy = gy*TILE + TILE/2;
-  if (!isRoundabout) {
-    if (Math.abs(dir.x) > 0) return { x: cx, y: cy + (dir.x > 0 ? +LANE_OFFSET : -LANE_OFFSET) };
-    return { x: cx + (dir.y > 0 ? -LANE_OFFSET : +LANE_OFFSET), y: cy };
-  }
-  const ring = Math.round(TILE * 0.30);
-  if (dir.x > 0)  return { x: cx,        y: cy + ring };
-  if (dir.x < 0)  return { x: cx,        y: cy - ring };
-  if (dir.y > 0)  return { x: cx - ring, y: cy       };
-  return            { x: cx + ring, y: cy       };
-}
-function lanePointInCell(gx, gy, dir, t){
-  const baseX = gx*TILE;  // Grid-relative
-  const baseY = gy*TILE;
-  if (Math.abs(dir.x) > 0){
-    const laneY = lanePositionFor(gx, gy, dir, false).y;
-    const x0 = dir.x > 0 ? baseX : baseX + TILE;
-    const x1 = dir.x > 0 ? baseX + TILE : baseX;
-    return { x: x0 + (x1 - x0) * t, y: laneY };
-  } else {
-    const laneX = lanePositionFor(gx, gy, dir, false).x;
-    const y0 = dir.y > 0 ? baseY : baseY + TILE;
-    const y1 = dir.y > 0 ? baseY + TILE : baseY;
-    return { x: laneX, y: y0 + (y1 - y0) * t };
-  }
-}
-function laneSnapPoint(gx, gy, dir, x, y){
-  if (Math.abs(dir.x) > 0){
-    const ly = lanePositionFor(gx, gy, dir, false).y;
-    return { x, y: ly };
-  } else {
-    const lx = lanePositionFor(gx, gy, dir, false).x;
-    return { x: lx, y };
-  }
-}
-function entryPosition(gx, gy, newDir) {
-  const inset = TILE * 0.18;
-  const baseX = gx * TILE;  // Grid-relative
-  const baseY = gy * TILE;
-  if (Math.abs(newDir.x) > 0) {
-    const x = newDir.x > 0 ? baseX + inset : baseX + TILE - inset;
-    const y = lanePositionFor(gx, gy, newDir, false).y;
-    return { x, y };
-  } else {
-    const y = newDir.y > 0 ? baseY + inset : baseY + TILE - inset;
-    const x = lanePositionFor(gx, gy, newDir, false).x;
-    return { x, y };
-  }
-}
-function turnType(fromDir, toDir){
-  const z = fromDir.x * toDir.y - fromDir.y * toDir.x;
-  if (z > 0) return "left";
-  if (z < 0) return "right";
-  return "straight";
-}
+// Note: lanePositionFor is now imported from GridSystem
+
+// Lane helper functions are now imported from NavigationSystem
 
 // ——— persona utils ———
 function pickPersonaKey(){
@@ -316,7 +267,14 @@ function pickPersonaKey(){
 }
 
 export default class CityScene extends Phaser.Scene {
-  constructor(){ super("CityScene"); }
+  constructor(){ 
+    super("CityScene");
+    this.gridSystem = null; // Initialized in applySim()
+    this.revealSystem = null; // Initialized in init()
+    this.navigationSystem = null; // Initialized in init()
+    this.renderSystem = null; // Initialized in create()
+    this.trafficSystem = null; // Initialized in create()
+  }
 
   init(){
     const sim = loadActiveLayout();
@@ -333,20 +291,19 @@ export default class CityScene extends Phaser.Scene {
     this.currPerMin = 0;
     this._incomeCarry = 0; // fractional carryover
 
-    this.traffic = [];
+    // Traffic system manages: this.traffic, this.cellPassTS, this.laneReserveTS
     this.copRingTween = null;
-
-    // occupancy + reservations
-    this.cellPassTS    = new Map();
-    this.laneReserveTS = new Map();
 
     this.mmScaleIdx = Number(lsGet(makePerSlotKey(MM_SCALE_KEY_BASE, this.activeSlotId), 0)) || 0;
     this.minimapOn = true;
     this.mmPos = lsGet(makePerSlotKey(MM_POS_KEY_BASE, this.activeSlotId), { x: null, y: null });
 
-    this.revealKey = makePerSlotKey(REVEAL_KEY_BASE, this.activeSlotId);
-    this.reveal = this.loadReveal();
-    this.lastCellKey = "";
+    // Initialize RevealSystem (fog of war)
+    this.revealSystem = new RevealSystem(this);
+    
+    // Initialize NavigationSystem (turn logic)
+    this.navigationSystem = new NavigationSystem(this);
+
 
     // APB runtime state
     this.apb = false;
@@ -370,9 +327,6 @@ export default class CityScene extends Phaser.Scene {
 
     // feel helpers
     this.lastCarDir = new Phaser.Math.Vector2(1,0);
-
-    // tile sprite tracking for cleanup
-    this.tileSprites = [];
 
     // performance throttles
     this._mmDirty = true;
@@ -398,12 +352,15 @@ export default class CityScene extends Phaser.Scene {
         return b === "road" || b === "avenue" || b === "start" || b === "roundabout";
       })
     );
+    
+    // Initialize GridSystem with scene reference
+    this.gridSystem = new GridSystem(this);
   }
 
   // ——— road graph + BFS ———
   _buildRoadGraph(){
     const adj = new Map();
-    const ok = (x,y)=> this.isRoadCell(x,y);
+    const ok = (x,y)=> this.gridSystem.isRoadCell(x,y);
     const add = (a,b) => { const k = cellKey(a.gx,a.gy); if(!adj.has(k)) adj.set(k,[]); adj.get(k).push(b); };
     for (let gy=0; gy<this.h; gy++){
       for (let gx=0; gx<this.w; gx++){
@@ -446,26 +403,6 @@ export default class CityScene extends Phaser.Scene {
   }
 
   // lane occupancy helpers
-  dirCode(d){ return `${(Math.sign(d.x)|0)},${(Math.sign(d.y)|0)}`; }
-  laneKey(gx,gy,dir){ return `${gx},${gy},${this.dirCode(dir)}`; }
-  laneReserveKey(gx,gy,dir){ return `${gx},${gy},${this.dirCode(dir)},RES`; }
-  reserveLane(gx,gy,dir,untilSec){ this.laneReserveTS.set(this.laneReserveKey(gx,gy,dir), untilSec); }
-  canEnterLane(gx,gy,dir,nowSec){
-    if (!this.isRoadCell(gx,gy)) return false;
-    const k  = this.laneKey(gx,gy,dir);
-    const last = this.cellPassTS.get(k) || 0;
-    const rsv  = this.laneReserveTS.get(this.laneReserveKey(gx,gy,dir)) || 0;
-    return (nowSec - last) >= CELL_GAP_SEC && nowSec >= rsv;
-  }
-  markLanePass(gx,gy,dir,nowSec){ this.cellPassTS.set(this.laneKey(gx,gy,dir), nowSec); }
-
-  randomRoadPixel(){
-    const cells=[];
-    for(let y=0;y<this.h;y++) for(let x=0;x<this.w;x++) if(this.isRoadCell(x,y)) cells.push({gx:x,gy:y});
-    if (!cells.length) return null;
-    const pick = cells[(Math.random()*cells.length)|0];
-    return { x: pick.gx*TILE, y: pick.gy*TILE };
-  }
 
   preload(){
     // ===== LOAD CITY PNG ASSETS =====
@@ -534,7 +471,17 @@ export default class CityScene extends Phaser.Scene {
     this.roadDetailGfx = this.add.graphics().setPosition(PADDING, PADDING).setDepth(2);
     this.fogGfx = this.add.graphics().setDepth(3);
     this.worldLayer.add([this.worldGfx, this.roadDetailGfx, this.fogGfx]);
+    
+    // Connect fog graphics to RevealSystem
+    this.revealSystem.setFogGraphics(this.fogGfx);
 
+    // Initialize RenderSystem
+    this.renderSystem = new RenderSystem(this);
+
+    // Initialize TrafficSystem
+    this.trafficSystem = new TrafficSystem(this);
+    this.trafficSystem.initialize(); // Set up spawn timer
+    
     // player + cop  
     const spawn = this.findStart() || { x: TILE, y: TILE };
 
@@ -547,11 +494,11 @@ export default class CityScene extends Phaser.Scene {
 
     // Grid-relative position (worldLayer's graphics handle PADDING)
     this.car = this.add.image(spawn.x + TILE/2, spawn.y + TILE/2, carTextureKey)
-      .setOrigin(0.5).setDepth(100).setVisible(true).setScale(0.35);
+      .setOrigin(0.5).setDepth(100).setVisible(true).setScale(0.30);
     this.worldLayer.add(this.car);
 
     this.cop = this.add.image(this.car.x, this.car.y, copTextureKey)
-      .setOrigin(0.5).setVisible(false).setDepth(99).setScale(0.35);
+      .setOrigin(0.5).setVisible(false).setDepth(99).setScale(0.30);
     this.copRing = this.add.circle(this.cop.x, this.cop.y, 8, 0xff3355, 0.22)
       .setStrokeStyle(2, 0xffc0c8, 0.9).setVisible(false).setDepth(98);
     this.worldLayer.add([this.cop, this.copRing]);
@@ -604,14 +551,14 @@ export default class CityScene extends Phaser.Scene {
       this.mmPos.y = Math.max(4, Math.min(this.scale.height - 40, dragY));
       try { localStorage.setItem(makePerSlotKey(MM_POS_KEY_BASE, this.activeSlotId), JSON.stringify(this.mmPos)); } catch {}
       this._mmDirty = true;
-      this.drawMinimap(true);
+      this.renderSystem.drawMinimap(true);
     });
     this.input.keyboard.on("keydown-M", () => {
       if (!this.minimapOn) this.minimapOn = true;
       else this.mmScaleIdx = (this.mmScaleIdx + 1) % MM_SCALES.length;
       try { localStorage.setItem(makePerSlotKey(MM_SCALE_KEY_BASE, this.activeSlotId), JSON.stringify(this.mmScaleIdx)); } catch {}
       this._mmDirty = true;
-      this.drawMinimap(true);
+      this.renderSystem.drawMinimap(true);
     });
     this.events.on("zoomChanged", () => { this._mmDirty = true; });
 
@@ -632,7 +579,7 @@ export default class CityScene extends Phaser.Scene {
     this.spawnCop = () => {
       let r = this.randomRoadPixel();
       if (!r) {
-        const { gx, gy } = this.pixToCell(this.car.x, this.car.y);
+        const { gx, gy } = this.gridSystem.pixToCell(this.car.x, this.car.y);
         r = { x: gx*TILE, y: gy*TILE };
       }
       // Grid-relative position
@@ -661,7 +608,7 @@ export default class CityScene extends Phaser.Scene {
       this._apbCaught = false;
       this._apbSpawnCarry = 0;
       this.spawnCop();
-      for (const t of this.traffic) t.spr.setTint(0xffea76);
+      for (const t of this.trafficSystem.traffic) t.spr.setTint(0xffea76);
       this._copRouteReset();
       this.updateCityHud();
       return true;
@@ -681,8 +628,7 @@ export default class CityScene extends Phaser.Scene {
     });
 
     // draw + loops
-    this.drawWorld(); this.drawFog(); this.revealAtCurrentCell(true); this._mmDirty = true; this.drawMinimap(true);
-    this.time.addEvent({ delay: TRAFFIC_SPAWN_MS, loop: true, callback: () => this.spawnTraffic() });
+    this.renderSystem.drawWorld(); this.revealSystem.drawFog(); this.revealSystem.revealAtCurrentCell(true); this._mmDirty = true; this.renderSystem.drawMinimap(true);
     this.unsubBoost = onBoostChange(({ mult, remainingSec }) => this.applyBoost(mult, remainingSec * 1000));
     this._storageHandler = () => { this._needReload = true; };
     window.addEventListener("storage", this._storageHandler);
@@ -699,7 +645,7 @@ export default class CityScene extends Phaser.Scene {
       }
 
       this._mmDirty = true;
-      this.drawMinimap(true);
+      this.renderSystem.drawMinimap(true);
     });
 
     // debug toggle
@@ -712,8 +658,8 @@ export default class CityScene extends Phaser.Scene {
     if (!this.worldLayer) return;
 
     // traffic over tiles
-    if (this.traffic) {
-      for (const t of this.traffic) {
+    if (this.trafficSystem.traffic) {
+      for (const t of this.trafficSystem.traffic) {
         if (t?.spr) this.worldLayer.bringToTop(t.spr);
       }
     }
@@ -748,40 +694,13 @@ export default class CityScene extends Phaser.Scene {
     this.saveZoom(nz);
     this.events.emit("zoomChanged", nz);
     this._mmDirty = true;
-    this.drawMinimap(true);
+    this.renderSystem.drawMinimap(true);
   }
   installZoomControls(worldCam){
     const upd = (z)=>this.setZoom(z);
     this.input.on("wheel", (_p,_go,_dx,dy)=>{ upd(worldCam.zoom + (dy>0?-1:1)*ZOOM_STEP); });
     this.input.keyboard.on("keydown-Q", ()=>upd(worldCam.zoom - ZOOM_STEP));
     this.input.keyboard.on("keydown-E", ()=>upd(worldCam.zoom + ZOOM_STEP));
-  }
-
-  loadReveal(){
-    const raw = lsGet(this.revealKey, null);
-    const ok = raw && typeof raw==="object" && raw.w===this.w && raw.h===this.h && raw.cells && typeof raw.cells==="object";
-    return ok ? raw : { w:this.w, h:this.h, cells:{} };
-  }
-  saveReveal(){ try { localStorage.setItem(this.revealKey, JSON.stringify(this.reveal)); } catch {} }
-  isRevealed(gx,gy){ return !!this.reveal.cells[cellKey(gx,gy)]; }
-  markRevealed(gx,gy){
-    if (gx<0||gy<0||gx>=this.w||gy>=this.h) return false;
-    const k = cellKey(gx,gy); if (this.reveal.cells[k]) return false;
-    this.reveal.cells[k]=1; return true;
-  }
-  revealAtCurrentCell(force=false){
-    const {gx,gy}=this.pixToCell(this.car.x,this.car.y);
-    const key = cellKey(gx,gy);
-    if (!force && key===this.lastCellKey) return;
-    this.lastCellKey = key;
-    let changed = this.markRevealed(gx,gy);
-    for (const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]) changed = this.markRevealed(gx+dx,gy+dy) || changed;
-    if (changed || force){ this.saveReveal(); this.drawFog(); this._mmDirty = true; this.drawMinimap(true); }
-  }
-  drawFog(){
-    const g=this.fogGfx; g.clear(); g.fillStyle(0x000000,0.55);
-    for(let y=0;y<this.h;y++) for(let x=0;x<this.w;x++)
-      if(!this.isRevealed(x,y)) g.fillRect(PADDING+x*TILE, PADDING+y*TILE, TILE, TILE);
   }
 
   countTiles(){
@@ -822,181 +741,7 @@ export default class CityScene extends Phaser.Scene {
   }
 
   // drawing
-  drawWorld(){
-    const g=this.worldGfx, dg=this.roadDetailGfx; if(!g||!dg) return;
-    
-    // CRITICAL: Destroy old tile sprites before creating new ones
-    if (this.tileSprites) {
-      this.tileSprites.forEach(sprite => sprite.destroy());
-    }
-    this.tileSprites = [];
-    
-    g.clear(); dg.clear();
-    for(let y=0;y<this.h;y++) for(let x=0;x<this.w;x++){
-      const b=normBase(this.grid[y]?.[x]); const px=x*TILE, py=y*TILE;
-      switch(b){
-        case "road": this.drawRoadSmart(g,dg,x,y,false); break;
-        case "avenue": this.drawRoadSmart(g,dg,x,y,true); break;
-        case "roundabout": this.drawRoundabout(g,dg,x,y); break;
-        case "park": this.drawPark(g,px,py); break;
-        case "home":
-        case "house": this.drawHouse(g,px,py); break;
-        case "shop": this.drawShop(g,px,py); break;
-        case "hq": this.drawHQ(g,px,py); break;
-        case "start": this.drawStart(g,px,py); break;
-        default: this.drawEmpty(g,px,py); break;
-      }
-    }
-    g.lineStyle(1,0x000000,0.18);
-    for(let x=0;x<=this.w;x++) g.lineBetween(x*TILE,0,x*TILE,this.h*TILE);
-    for(let y=0;y<=this.h;y++) g.lineBetween(0,y*TILE,this.w*TILE,y*TILE);
-    this._mmDirty = true;
 
-    // After adding tiles, pull entities back to the top of the container
-    this._refreshEntityDepths();
-  }
-  isRoadTile(gx,gy){
-    if (gy<0||gy>=this.h||gx<0||gx>=this.w) return false;
-    const b=normBase(this.grid[gy]?.[gx]); return b==="road"||b==="avenue"||"roundabout"===b;
-  }
-  roadNeighbors(gx,gy){ return { n:this.isRoadTile(gx,gy-1), s:this.isRoadTile(gx,gy+1), w:this.isRoadTile(gx-1,gy), e:this.isRoadTile(gx+1,gy) }; }
-  isRoundaboutCell(gx,gy){ return normBase(this.grid[gy]?.[gx])==="roundabout"; }
-  drawRoadSmart(g,dg,gx,gy,avenue){
-    const x=gx*TILE, y=gy*TILE;
-    
-    // Get neighbor information
-    const nb=this.roadNeighbors(gx,gy);
-    
-    // Determine which road sprite to use based on connections
-    const tileId = avenue ? 'avenue' : 'road';
-    const textureKey = getRoadTextureKey(tileId, { n: nb.n, s: nb.s, e: nb.e, w: nb.w });
-    
-    // Draw the PNG sprite if available, otherwise fallback to old method
-    if (this.textures.exists(textureKey)) {
-      // Grid-relative position (worldLayer handles offset)
-      const sprite = this.add.image(x + TILE/2, y + TILE/2, textureKey);
-      sprite.setDisplaySize(TILE, TILE);
-      sprite.setDepth(1);
-      this.worldLayer.add(sprite); // Add to worldLayer for consistent zoom
-      this.tileSprites.push(sprite);
-    } else {
-      // Fallback to procedural graphics if PNG not loaded
-      g.fillStyle(avenue?0x2e2e2e:0x343434,1).fillRect(x,y,TILE,TILE);
-      g.lineStyle(1,0x222222,0.9).strokeRect(x+0.5,y+0.5,TILE-1,TILE-1);
-      if (nb.w && nb.e){ const ymid=y+TILE/2-1; dg.fillStyle(0xffffff,0.35); for(let i=x+2;i<x+TILE-6;i+=8) dg.fillRect(i,ymid,6,2); }
-      if (nb.n && nb.s){ const xmid=x+TILE/2-1; dg.fillStyle(0xffffff,0.35); for(let j=y+2;j<y+TILE-6;j+=8) dg.fillRect(xmid,j,2,6); }
-      if (avenue && nb.n && nb.s){ const xm=x+TILE/2-2; dg.fillStyle(0xfff3,0.22).fillRect(xm,y+2,4,TILE-4); }
-    }
-  }
-  drawRoundabout(g,dg,gx,gy){
-    const x=gx*TILE, y=gy*TILE;
-    
-    // Draw the PNG sprite if available
-    if (this.textures.exists('road_roundabout')) {
-      const sprite = this.add.image(x + TILE/2, y + TILE/2, 'road_roundabout');
-      sprite.setDisplaySize(TILE, TILE);
-      sprite.setDepth(1);
-      this.worldLayer.add(sprite);
-      this.tileSprites.push(sprite);
-    } else {
-      // Fallback to procedural graphics
-      const cx=x+TILE/2, cy=y+TILE/2;
-      g.fillStyle(0x343434,1).fillRect(x,y,TILE,TILE);
-      g.lineStyle(1,0x222222,0.9).strokeRect(x+0.5,y+0.5,TILE-1,TILE-1);
-      const rOuter=TILE*0.26, rInner=TILE*0.14;
-      dg.fillStyle(0x222326,1).fillCircle(cx,cy,rOuter);
-      dg.fillStyle(0x111215,1).fillCircle(cx,cy,rInner);
-      dg.lineStyle(1,0x2b2d31,0.9).strokeCircle(cx,cy,rOuter);
-    }
-  }
-  drawEmpty(g,x,y){ 
-    // Background ground: muted grass so it doesn’t overpower roads/buildings
-    if (this.textures.exists('terrain_grass')) {
-      const sprite = this.add.image(x + TILE/2, y + TILE/2, 'terrain_grass');
-      sprite.setDisplaySize(TILE, TILE);
-      sprite.setDepth(0);
-      sprite.setTint(GRASS_TINT);
-      sprite.setAlpha(GRASS_ALPHA);
-      this.worldLayer.add(sprite);
-      this.tileSprites.push(sprite);
-    } else {
-      // Slightly darker neutral fallback
-      g.fillStyle(0x181b20,1).fillRect(x,y,TILE,TILE); 
-    }
-  }
-  drawPark(g,x,y){ 
-    // Parks stay a touch richer, but still toned down from neon
-    g.fillStyle(PARK_COLOR,1).fillRect(x,y,TILE,TILE); 
-  }
-  drawHouse(g,x,y){ 
-    // Draw house building with 3/4 perspective
-    if (this.textures.exists('house_small')) {
-      const sprite = this.add.image(x + TILE/2, y + TILE, 'house_small');
-      sprite.setOrigin(0.5, 1.0);
-      
-      // Scale to fit width but maintain aspect ratio
-      const scale = TILE / 64;
-      sprite.setScale(scale);
-      
-      sprite.setDepth(5);
-      this.worldLayer.add(sprite);
-      this.tileSprites.push(sprite);
-    } else {
-      g.fillStyle(0x4a4a4a,1).fillRect(x,y,TILE,TILE); 
-    }
-  }
-  drawShop(g,x,y){ 
-    // Shop uses PNG when available, else colored placeholder
-    if (this.textures.exists("building_shop")) {
-      const sprite = this.add.image(x + TILE / 2, y + TILE, "building_shop");
-      sprite.setOrigin(0.5, 1.0);
-      const scale = TILE / 64;
-      sprite.setScale(scale);
-      sprite.setDepth(5);
-      this.worldLayer.add(sprite);
-      this.tileSprites.push(sprite);
-    } else {
-      g.fillStyle(0x6078ff,1).fillRect(x,y,TILE,TILE); 
-    }
-  }
-  drawHQ(g,x,y){ 
-    // HQ uses PNG when available, else colored placeholder
-    if (this.textures.exists("building_hq")) {
-      const sprite = this.add.image(x + TILE / 2, y + TILE, "building_hq");
-      sprite.setOrigin(0.5, 1.0);
-      const scale = TILE / 64;
-      sprite.setScale(scale);
-      sprite.setDepth(5);
-      this.worldLayer.add(sprite);
-      this.tileSprites.push(sprite);
-    } else {
-      g.fillStyle(0xb94b5e,1).fillRect(x,y,TILE,TILE); 
-    }
-  }
-  drawStart(g,x,y){ 
-    // Start tile uses house (player's home)
-    if (this.textures.exists('house_small')) {
-      const sprite = this.add.image(x + TILE/2, y + TILE, 'house_small');
-      sprite.setOrigin(0.5, 1.0);
-      
-      // Scale to fit width but maintain aspect ratio
-      const scale = TILE / 64;
-      sprite.setScale(scale);
-      
-      sprite.setDepth(5);
-      this.worldLayer.add(sprite);
-      this.tileSprites.push(sprite);
-    } else {
-      g.fillStyle(0xe2a23a,1).fillRect(x,y,TILE,TILE);
-      g.fillStyle(0x000000,0.25).fillTriangle(x+TILE*0.2,y+TILE*0.7, x+TILE*0.5,y+TILE*0.3, x+TILE*0.8,y+TILE*0.7); 
-    }
-  }
-
-  pixToCell(px,py){ return { gx: Math.floor(px/TILE), gy: Math.floor(py/TILE) }; }
-  isInsideGrid(gx,gy){ return gx>=0 && gy>=0 && gx<this.w && gy<this.h; }
-  isRoadCell(gx,gy){ return this.isInsideGrid(gx,gy) && this.drive[gy][gx]; }
-  isRoadPixel(px,py){ const {gx,gy}=this.pixToCell(px,py); return this.isRoadCell(gx,gy); }
-  leaveWorld(nx,ny){ const {gx,gy}=this.pixToCell(nx,ny); return !this.isInsideGrid(gx,gy); }
 
   findStart(){
     for(let y=0;y<this.h;y++) for(let x=0;x<this.w;x++)
@@ -1006,271 +751,40 @@ export default class CityScene extends Phaser.Scene {
         const opts=[[1,0],[-1,0],[0,1],[0,-1]];
         for(const [dx,dy] of opts){
           const gx=x+dx, gy=y+dy;
-          if (this.isRoadCell(gx,gy)) return { x:gx*TILE, y:gy*TILE };
+          if (this.gridSystem.isRoadCell(gx,gy)) return { x:gx*TILE, y:gy*TILE };
         }
       }
     }
-    for(let y=0;y<this.h;y++) for(let x=0;x<this.w;x++) if(this.isRoadCell(x,y)) return { x:x*TILE, y:y*TILE };
+    for(let y=0;y<this.h;y++) for(let x=0;x<this.w;x++) if(this.gridSystem.isRoadCell(x,y)) return { x:x*TILE, y:y*TILE };
     return { x:0, y:0 };
   }
 
+  randomRoadPixel(){
+    const roads = [];
+    for(let y=0;y<this.h;y++) {
+      for(let x=0;x<this.w;x++) {
+        if(this.gridSystem.isRoadCell(x,y)) {
+          roads.push({ x:x*TILE, y:y*TILE });
+        }
+      }
+    }
+    if(!roads.length) return null;
+    return roads[Math.floor(Math.random() * roads.length)];
+  }
+
   // base turns
-  turnRight(d){ if (d.x===1) return {x:0,y:1}; if (d.x===-1) return {x:0,y:-1}; if (d.y===1) return {x:-1,y:0}; return {x:1,y:0}; }
-  goStraight(d){ return {x:d.x, y:d.y}; }
-  turnLeft(d){ if (d.x===1) return {x:0,y:-1}; if (d.x===-1) return {x:0,y:1}; if (d.y===1) return {x:1,y:0}; return {x:-1,y:0}; }
-  circulateTurn(d){ return (TRAFFIC_SIDE==="right") ? this.turnLeft(d) : this.turnRight(d); }
-  exitTurn(d){ return (TRAFFIC_SIDE==="right") ? this.turnRight(d) : this.turnLeft(d); }
-
-  // NEW: corner control point based on lane intersection (no diagonal slicing)
-  cornerControl(from, to, fromDir, toDir) {
-    // from: point on incoming lane
-    // to:   entry point on outgoing lane
-    // For a 90° turn, use intersection of incoming lane Y with outgoing lane X
-    if (Math.abs(fromDir.x) > 0 && Math.abs(toDir.y) > 0) {
-      // coming horizontally, leaving vertically
-      return { x: to.x, y: from.y };
-    }
-    if (Math.abs(fromDir.y) > 0 && Math.abs(toDir.x) > 0) {
-      // coming vertically, leaving horizontally
-      return { x: from.x, y: to.y };
-    }
-
-    // Fallback (straight or weird) – midpoint
-    return {
-      x: (from.x + to.x) * 0.5,
-      y: (from.y + to.y) * 0.5,
-    };
-  }
-
-  cellProgress(dir, x, y, baseX, baseY) {
-    if (Math.abs(dir.x) > 0) return dir.x > 0 ? (x - baseX) / TILE : ((baseX + TILE) - x) / TILE;
-    return dir.y > 0 ? (y - baseY) / TILE : ((baseY + TILE) - y) / TILE;
-  }
 
   // UPDATED: use from/to lane points for the corner control
-  startBezierTurn(t, cNow, chooseDir, dstCell, nowSec, progInCell=0.7){
-    const sClamped = Math.max(0.06, Math.min(0.95, progInCell));
-
-    // Incoming lane point (current cell, near exit edge)
-    const from = lanePointInCell(cNow.gx, cNow.gy, t.dir, sClamped);
-
-    // Outgoing lane entry point (next cell)
-    const to   = entryPosition(dstCell.x, dstCell.y, chooseDir);
-
-    // Control point at intersection of lane centerlines to avoid diagonal cuts
-    const ctrl = this.cornerControl(from, to, t.dir, chooseDir);
-
-    const len  = quadLen(from, ctrl, to) || TILE;
-    this.reserveLane(dstCell.x, dstCell.y, chooseDir, nowSec + RESERVE_SEC);
-    t.turn = {
-      s: 0,
-      from,
-      ctrl,
-      to,
-      len,
-      newDir: { x: chooseDir.x, y: chooseDir.y },
-      dst: { x: dstCell.x, y: dstCell.y }
-    };
-  }
 
   // ——— U-turn helpers ———
-  reverseDir(d){ return { x: -d.x, y: -d.y }; }
-  startUTurn(t, cNow, nowSec, progInCell=0.8){
-    const dir = t.dir;
-    const sClamped = Math.max(0.06, Math.min(0.95, progInCell));
-    const from = lanePointInCell(cNow.gx, cNow.gy, dir, sClamped);
-
-    const center = {
-      x: cNow.gx*TILE + TILE/2,  // Grid-relative
-      y: cNow.gy*TILE + TILE/2
-    };
-    const to   = entryPosition(cNow.gx, cNow.gy, this.reverseDir(dir));
-
-    const ctrl = {
-      x: center.x + (dir.y !== 0 ? 0 : (dir.x > 0 ? +TILE*0.35 : -TILE*0.35)),
-      y: center.y + (dir.x !== 0 ? 0 : (dir.y > 0 ? +TILE*0.35 : -TILE*0.35)),
-    };
-
-    const len = quadLen(from, ctrl, to) || TILE;
-    t.turn = {
-      s:0, from, ctrl, to, len,
-      newDir: this.reverseDir(dir),
-      dst: { x:cNow.gx, y:cNow.gy }
-    };
-    this.reserveLane(cNow.gx, cNow.gy, t.turn.newDir, nowSec + RESERVE_SEC*0.6);
-  }
 
   // —— NEW: local tests for safe U-turns ——
 // True cul-de-sac detection: we only allow U-turn if the car is
 // effectively boxed in and not next to a roundabout shortcut.
-  isRoundaboutNeighbor(gx, gy){
-    for (let dx=-NO_UTURN_NEAR_RB_CELLS; dx<=NO_UTURN_NEAR_RB_CELLS; dx++){
-      for (let dy=-NO_UTURN_NEAR_RB_CELLS; dy<=NO_UTURN_NEAR_RB_CELLS; dy++){
-        if (dx===0 && dy===0) continue;
-        const x=gx+dx, y=gy+dy;
-        if (this.isInsideGrid(x,y) && this.isRoundaboutCell(x,y)) return true;
-      }
-    }
-    return false;
-  }
-  trueCulDeSac(cNow, dir){
-    const f1 = { x: cNow.gx + dir.x, y: cNow.gy + dir.y };
-    if (this.isRoadCell(f1.x, f1.y)) {
-      const l = this.turnLeft(dir), r = this.turnRight(dir);
-      const l1 = { x: f1.x + l.x, y: f1.y + l.y };
-      const r1 = { x: f1.x + r.x, y: f1.y + r.y };
-      const f2 = { x: f1.x + dir.x, y: f1.y + dir.y };
-      if (this.isRoadCell(l1.x,l1.y) || this.isRoadCell(r1.x,r1.y) || this.isRoadCell(f2.x,f2.y)) return false;
-      return true;
-    }
-    const nearRB = this.isRoundaboutCell(cNow.gx, cNow.gy) || this.isRoundaboutNeighbor(cNow.gx, cNow.gy);
-    return !nearRB;
-  }
-
-  edgeRoadCells(){
-    const cells = [];
-    for (let x=0;x<this.w;x++){
-      if (this.isRoadCell(x,0) && this.isRoadCell(x,1)) cells.push({gx:x, gy:0, dir:{x:0,y:1}});
-      if (this.isRoadCell(x,this.h-1) && this.isRoadCell(x,this.h-2)) cells.push({gx:x, gy:this.h-1, dir:{x:0,y:-1}});
-    }
-    for (let y=0;y<this.h;y++){
-      if (this.isRoadCell(0,y) && this.isRoadCell(1,y)) cells.push({gx:0, gy:y, dir:{x:1,y:0}});
-      if (this.isRoadCell(this.w-1,y) && this.isRoadCell(this.w-2,y)) cells.push({gx:this.w-1, gy:y, dir:{x:-1,y:0}});
-    }
-    return cells;
-  }
-
-  pickSpawnPoint(){
-    const cam = this.cameras.main;
-    const view = cam.worldView;
-    const marginRect = new Phaser.Geom.Rectangle(
-      view.x - VIEW_BIAS_MARGIN, view.y - VIEW_BIAS_MARGIN,
-      view.width + VIEW_BIAS_MARGIN*2, view.height + VIEW_BIAS_MARGIN*2
-    );
-    const car = new Phaser.Math.Vector2(this.car.x, this.car.y);
-
-    const starts = [];
-    for (const e of this.edgeRoadCells()) starts.push(e);
-    for (let gy = 0; gy < this.h; gy++) for (let gx = 0; gx < this.w; gx++) {
-      if (!this.isRoadCell(gx, gy)) continue;
-      const axis = this.roadOrientation(gx, gy);
-      const dirs = axis === "h" ? [{x:1,y:0},{x:-1,y:0}] : [{x:0,y:1},{x:0,y:-1}];
-      for (const d of dirs) {
-        const nx = gx + d.x, ny = gy + d.y;
-        if (this.isRoadCell(nx, ny)) starts.push({ gx, gy, dir: d });
-      }
-    }
-    if (!starts.length) return null;
-
-    const scored = [];
-    for (const s of starts) {
-      const px = s.gx*TILE + TILE/2;  // Grid-relative
-      const py = s.gy*TILE + TILE/2;
-      const inView = marginRect.contains(px, py);
-      const farFromPlayer = Phaser.Math.Distance.Between(px, py, car.x, car.y) > PLAYER_SPAWN_AVOID_RADIUS;
-      const score = (inView ? 0 : 2) + (farFromPlayer ? 1 : 0);
-      scored.push({ s, score });
-    }
-    scored.sort((a,b)=>b.score-a.score);
-    const topScore = scored[0].score;
-    const top = scored.filter(k=>k.score===topScore).map(k=>k.s);
-    return top[(Math.random()*top.length)|0];
-  }
-
-  spawnTraffic(){
-    if (this.traffic.length >= TRAFFIC_MAX) return;
-    const cell = this.pickSpawnPoint();
-    if (!cell) return;
-
-    let dir = cell.dir
-      ? vec(cell.dir.x, cell.dir.y)
-      : (() => {
-          const axis = this.roadOrientation(cell.gx, cell.gy);
-          return axis==="h" ? vec(Math.random()<0.5?1:-1,0) : vec(0,Math.random()<0.5?1:-1);
-        })();
-
-    const nowSec = this.time.now/1000;
-    if (!this.canEnterLane(cell.gx, cell.gy, dir, nowSec)) return;
-
-    const fwd = { x: cell.gx + dir.x, y: cell.gy + dir.y };
-    if (!this.isRoadCell(fwd.x, fwd.y)) return;
-
-    // persona selection
-    const kind = pickPersonaKey();
-    const P = PERSONAS[kind];
-
-    const pos = lanePositionFor(cell.gx, cell.gy, dir, this.isRoundaboutCell(cell.gx, cell.gy));
-
-    const vehicleKey = this.textures.exists("vehicle_sedan")
-      ? getRandomTrafficVehicle()
-      : P.tex;
-
-    const spr = this.add.image(pos.x, pos.y, vehicleKey)
-      .setTint(this.apb ? 0xffea76 : P.tint)
-      .setDepth(4).setAlpha(0.95).setScale(0.25);
-
-    // Initial orientation matches travel direction (cardinal only)
-    if (dir && (dir.x || dir.y)) {
-      spr.setRotation(this.angleForDir(dir));
-    }
-
-    this.worldLayer.add(spr);
-
-    // store per-car traits
-    this.traffic.push({
-      spr, dir, wait:0, inRound:false, rbCell:null, laps:0, lastKey:"", turn:null,
-      lastUTurnAt: -999, justExitedRBUntil: 0,
-      kind,
-      speedMult: P.mult,
-      ignoreYield: P.ignoreYield,
-      uturnCd: P.uturnCd,
-      chaosBias: P.chaosBias,
-      followGapPx: P.followGapPx,
-      rearendRate: P.rearendRate,
-      crashDistPx: P.crashDistPx,
-      chaosHoldCellKey: "", // prevents turning in this cell once triggered
-    });
-    this.markLanePass(cell.gx, cell.gy, dir, nowSec);
-
-    // Ensure new traffic doesn't get buried by later tiles
-    this._refreshEntityDepths();
-  }
 
 
-  angleForDir(dir){
-    const dx = (dir && typeof dir.x === "number") ? dir.x : 0;
-    const dy = (dir && typeof dir.y === "number") ? dir.y : 0;
-    if (!dx && !dy) return 0;
-    return Phaser.Math.Angle.Between(0, 0, dx, dy) + CAR_ROT_OFFSET;
-  }
 
-  roadOrientation(gx,gy){
-    const nb=this.roadNeighbors(gx,gy);
-    const horiz=(nb.w||nb.e), vert=(nb.n||nb.s);
-    if (horiz && !vert) return "h";
-    if (vert && !horiz) return "v";
-    return Math.random()<0.5 ? "h" : "v";
-  }
 
-  edgePosition(gx, gy, newDir){
-    if (Math.abs(newDir.x) > 0) {
-      const x = (gx + (newDir.x > 0 ? 1 : 0)) * TILE;  // Grid-relative
-      const y = lanePositionFor(gx, gy, newDir, this.isRoundaboutCell(gx, gy)).y;
-      return { x, y };
-    } else {
-      const y = (gy + (newDir.y > 0 ? 1 : 0)) * TILE;
-      const x = lanePositionFor(gx, gy, newDir, this.isRoundaboutCell(gx, gy)).x;
-      return { x, y };
-    }
-  }
-
-  canPlanTurnFrom(cNow, _dir, chooseDir, nowSec){
-    const first = { x: cNow.gx + chooseDir.x, y: cNow.gy + chooseDir.y };
-    const second = { x: first.x + chooseDir.x, y: first.y + chooseDir.y };
-    const ok1 = this.isRoadCell(first.x, first.y) && this.canEnterLane(first.x, first.y, chooseDir, nowSec);
-    const ok2 = this.isRoadCell(second.x, second.y);
-    return ok1 && ok2 ? { first, second } : null;
-  }
 
   // ——— crash burst ———
   spawnCrash(x, y){
@@ -1318,338 +832,9 @@ export default class CityScene extends Phaser.Scene {
 // Cars will slow/stop when following another car too closely on the same lane,
 // with persona-dependent follow distance and a small probability of rear-end
 // collisions under tight spacing.
-  _carAheadSameLane(t){
-    const meX = t.spr.x, meY = t.spr.y;
-    const horiz = Math.abs(t.dir.x) > 0;
-    let best = null;
-    for (let i=0;i<this.traffic.length;i++){
-      const o = this.traffic[i];
-      if (o === t || o.turn) continue;
-      if (o.dir.x !== t.dir.x || o.dir.y !== t.dir.y) continue;
-      if (horiz){
-        if (Math.abs(o.spr.y - meY) > 1.0) continue;
-        const ahead = (t.dir.x>0) ? (o.spr.x > meX) : (o.spr.x < meX);
-        if (!ahead) continue;
-        const dpx = Math.abs(o.spr.x - meX);
-        if (!best || dpx < best.dpx) best = { idx:i, dpx, x:o.spr.x, y:o.spr.y };
-      }else{
-        if (Math.abs(o.spr.x - meX) > 1.0) continue;
-        const ahead = (t.dir.y>0) ? (o.spr.y > meY) : (o.spr.y < meY);
-        if (!ahead) continue;
-        const dpx = Math.abs(o.spr.y - meY);
-        if (!best || dpx < best.dpx) best = { idx:i, dpx, x:o.spr.x, y:o.spr.y };
-      }
-    }
-    return best;
-  }
 
-  _applyFollowGapClamp(t, nx, ny, lead){
-    if (!lead) return { nx, ny, clamped:false };
-    const gap = Math.max(3, t.followGapPx||10);
-    const horiz = Math.abs(t.dir.x) > 0;
-    if (horiz){
-      if (t.dir.x>0){
-        const maxX = lead.x - gap;
-        if (nx > maxX) return { nx:maxX, ny, clamped:true };
-      } else {
-        const minX = lead.x + gap;
-        if (nx < minX) return { nx:minX, ny, clamped:true };
-      }
-    } else {
-      if (t.dir.y>0){
-        const maxY = lead.y - gap;
-        if (ny > maxY) return { nx, ny:maxY, clamped:true };
-      } else {
-        const minY = lead.y + gap;
-        if (ny < minY) return { nx, ny:minY, clamped:true };
-      }
-    }
-    return { nx, ny, clamped:false };
-  }
 
-  _maybeRearEnd(t, leadInfo, dt){
-    if (!leadInfo) return false;
-    const dangerPx = Math.max(3, t.crashDistPx||5);
-    if (leadInfo.dpx > dangerPx) return false;
-    const rate = Math.max(0, t.rearendRate||0);
-    const p = 1 - Math.exp(-rate * dt);
-    if (Math.random() < p){
-      const L = this.traffic[leadInfo.idx];
-      const cx = (t.spr.x + L.spr.x) * 0.5;
-      const cy = (t.spr.y + L.spr.y) * 0.5;
-      this.spawnCrash(cx, cy);
-      if (Math.random() < 0.6){
-        L.spr.destroy(); this.traffic.splice(leadInfo.idx, 1);
-      }
-      t._flagCrashed = true;
-      return true;
-    }
-    return false;
-  }
 
-  stepTraffic(dt){
-    const nowSec = this.time.now/1000;
-    if (this._trafficDebug) this.roadDetailGfx.clear();
-
-    for (let i=this.traffic.length-1;i>=0;i--){
-      const t=this.traffic[i];
-      if (t.wait>0){ t.wait-=dt; continue; }
-
-      // Keep sprite rotation aligned with its current travel direction (cardinal)
-      if (t.dir && (t.dir.x || t.dir.y)) {
-        t.spr.setRotation(this.angleForDir(t.dir));
-      }
-
-      if (this.apb && this.time.now >= this._nextFlickerAt) {
-        t.spr.setAlpha(0.85 + 0.1*Math.sin(this.time.now*0.02));
-      } else if (!this.apb) {
-        const baseTint = PERSONAS[t.kind]?.tint ?? 0xbfd1ff;
-        if (t.spr.tintTopLeft !== baseTint) t.spr.setTint(baseTint);
-      }
-
-      if (t.turn){
-        const speed = (TRAFFIC_SPEED * t.speedMult) * 0.9 * dt;
-        const a = Math.min(1, speed / (t.turn.len || TILE));
-        t.turn.s = Math.min(1, t.turn.s + a);
-
-        const s = t.turn.s, u = 1 - s;
-        const x = u*u*t.turn.from.x + 2*u*s*t.turn.ctrl.x + s*s*t.turn.to.x;
-        const y = u*u*t.turn.from.y + 2*u*s*t.turn.ctrl.y + s*s*t.turn.to.y;
-        t.spr.setPosition(x, y);
-
-        // Update rotation immediately during the turn based on new direction
-        const angle = Phaser.Math.Angle.Between(0, 0, t.turn.newDir.x, t.turn.newDir.y);
-        t.spr.setRotation(angle + CAR_ROT_OFFSET);
-
-        if (t.turn.s >= 1){
-          this.markLanePass(t.turn.dst.x, t.turn.dst.y, t.turn.newDir, nowSec);
-          t.dir.set(t.turn.newDir.x, t.turn.newDir.y);
-          t.turn = null;
-          t.wait = 0.04;
-        }
-        continue;
-      }
-
-      const cNow = this.pixToCell(t.spr.x, t.spr.y);
-      const baseX = cNow.gx*TILE, baseY = cNow.gy*TILE;  // Grid-relative
-      const prog  = this.cellProgress(t.dir, t.spr.x, t.spr.y, baseX, baseY);
-
-      // ROUNDABOUT HANDLING WITH STABLE CELL
-      const inRbCellNow = this.isRoundaboutCell(cNow.gx, cNow.gy) || (t.inRound && t.rbCell);
-      if (inRbCellNow) {
-        // Lock to the first roundabout cell we detected so we don't jitter between cells
-        if (!t.inRound || !t.rbCell) {
-          t.inRound = true;
-          t.rbCell = { gx: cNow.gx, gy: cNow.gy };
-        }
-        const rb = t.rbCell;
-
-        const right = this.exitTurn(t.dir);
-        const gxExit = rb.gx + right.x, gyExit = rb.gy + right.y;
-
-        const exitHasRoad = this.isRoadCell(gxExit, gyExit) && !this.isRoundaboutCell(gxExit, gyExit);
-        const exitClear   = exitHasRoad && this.canEnterLane(gxExit, gyExit, right, nowSec);
-        const gxFar = gxExit + right.x, gyFar = gyExit + right.y;
-        const farOk = this.isRoadCell(gxFar, gyFar);
-
-        const mustExit = t.laps >= ROUND_MAX_LAPS;
-        const readyExit = exitClear && (t.laps >= ROUND_MIN_LAPS) && (farOk || Math.random()<0.25);
-
-        if (exitClear && (mustExit || readyExit)) {
-          t.dir.set(right.x, right.y);
-          const posExit = lanePositionFor(gxExit, gyExit, t.dir, this.isRoundaboutCell(gxExit, gyExit));
-          t.spr.setPosition(posExit.x, posExit.y);
-          this.markLanePass(gxExit, gyExit, t.dir, nowSec);
-          t.inRound = false;
-          t.rbCell = null;
-          t.laps = 0;
-          t.wait = 0.08;
-          t.justExitedRBUntil = this.time.now/1000 + 0.8;
-          continue;
-        }
-
-        const r = this.circulateTurn(t.dir);
-        t.dir.set(r.x, r.y);
-        const pos = lanePositionFor(rb.gx, rb.gy, t.dir, true);
-        t.spr.setPosition(pos.x, pos.y);
-        t.wait = 0.06;
-        t.laps += ROUND_STEP;
-        continue;
-      }
-
-      // non-roundabout logic
-      t.inRound = false;
-      t.rbCell = null;
-
-      if (!this.isRoundaboutCell(cNow.gx, cNow.gy)) {
-        const leftD = this.turnLeft(t.dir);
-        const rghtD = this.exitTurn(t.dir);
-
-        let rightPlan = this.canPlanTurnFrom(cNow, t.dir, rghtD, nowSec);
-        let leftPlan  = this.canPlanTurnFrom(cNow, t.dir, leftD,  nowSec);
-
-        if (rightPlan && !this.canEnterLane(rightPlan.first.x, rightPlan.first.y, rghtD, nowSec)) {
-          if (Math.random() < (t.ignoreYield||0)) { /* allow */ }
-          else rightPlan = null;
-        }
-        if (leftPlan && !this.canEnterLane(leftPlan.first.x, leftPlan.first.y, leftD, nowSec)) {
-          if (Math.random() < (t.ignoreYield||0)) { /* allow */ }
-          else leftPlan = null;
-        }
-
-        const DECIDE_START = 0.20, DECIDE_END = 0.92;
-        let chooseDir = null, dstCell = null;
-
-        const fwd1 = { x: cNow.gx + t.dir.x, y: cNow.gy + t.dir.y };
-        const fwd2 = { x: fwd1.x + t.dir.x, y: fwd1.y + t.dir.y };
-        const deadAhead = !this.isRoadCell(fwd1.x, fwd1.y) || !this.isRoadCell(fwd2.x, fwd2.y);
-
-        const cellK = cellKey(cNow.gx, cNow.gy);
-        const chaosChance = CHAOS_CRASH_BASE * (t.chaosBias || 1.0) * (this.apb ? 1.25 : 1.0);
-        if (prog >= DECIDE_START && prog <= DECIDE_END && t.chaosHoldCellKey !== cellK) {
-          if (Math.random() < chaosChance) {
-            t.chaosHoldCellKey = cellK;
-          }
-        }
-
-        if (t.chaosHoldCellKey !== cellK) {
-          if (prog >= DECIDE_START && prog <= DECIDE_END){
-            if (deadAhead) {
-              if (rightPlan) { chooseDir = rghtD; dstCell = rightPlan.first; }
-              else if (leftPlan) { chooseDir = leftD; dstCell = leftPlan.first; }
-            } else {
-              const opts = [];
-              if (rightPlan) opts.push({ d:rghtD, c:rightPlan.first });
-              if (leftPlan)  opts.push({ d:leftD,  c:leftPlan.first  });
-              if (opts.length && Math.random()<0.20){
-                const pick = opts[(Math.random()*opts.length)|0];
-                chooseDir = pick.d; dstCell = pick.c;
-              }
-            }
-          } else if (prog > DECIDE_END) {
-            if (deadAhead) {
-              if (rightPlan) { chooseDir = rghtD; dstCell = rightPlan.first; }
-              else if (leftPlan) { chooseDir = leftD; dstCell = leftPlan.first; }
-            }
-          }
-        }
-
-        if (chooseDir){
-          const tt = turnType(t.dir, chooseDir);
-          const bias = tt === "left" ? +0.05 : tt === "right" ? -0.03 : 0;
-          const progAdj = Math.max(0.0, Math.min(1.0, prog + bias));
-          this.startBezierTurn(t, cNow, chooseDir, dstCell, nowSec, progAdj);
-          continue;
-        }
-
-        const nowS = this.time.now/1000;
-        const canUTCooldown = (nowS - (t.lastUTurnAt||-999)) >= (t.uturnCd ?? UTURN_COOLDOWN_SEC);
-        const notJustExitedRB = nowS >= (t.justExitedRBUntil||0);
-        const okProg = prog >= UTURN_MIN_PROGRESS;
-        if (!rightPlan && !leftPlan && okProg && canUTCooldown && notJustExitedRB && this.trueCulDeSac(cNow, t.dir)) {
-          this.startUTurn(t, cNow, nowSec, prog);
-          t.lastUTurnAt = nowS;
-          continue;
-        }
-      }
-
-      // straight motion + tailgating
-      const speed = (TRAFFIC_SPEED * (t.speedMult || 1)) * dt;
-      let nx = t.spr.x + t.dir.x*speed;
-      let ny = t.spr.y + t.dir.y*speed;
-
-      if (this.leaveWorld(nx, ny)) { t.spr.destroy(); this.traffic.splice(i,1); continue; }
-
-      const cNext = this.pixToCell(nx, ny);
-
-      // persona chaos: crash if overshoot into dead end
-      const fwdCell = { x: cNow.gx + t.dir.x, y: cNow.gy + t.dir.y };
-      if (!this.isRoadCell(fwdCell.x, fwdCell.y) && this.isRoadPixel(t.spr.x, t.spr.y) && this.cellProgress(t.dir, t.spr.x, t.spr.y, cNow.gx*TILE, cNow.gy*TILE) > 0.92) {
-        this.spawnCrash(t.spr.x, t.spr.y);
-        t.spr.destroy();
-        this.traffic.splice(i,1);
-        continue;
-      }
-
-      // standard lane spacing/yield at cell boundary
-      if ((cNext.gx!==cNow.gx || cNext.gy!==cNow.gy) && this.isRoadCell(cNext.gx,cNext.gy)) {
-        if (!this.canEnterLane(cNext.gx, cNext.gy, t.dir, nowSec)){
-          if (Math.random() < (t.ignoreYield||0)) {
-            this.markLanePass(cNext.gx, cNext.gy, t.dir, nowSec);
-          } else {
-            t.wait=YIELD_PAUSE_SEC; continue;
-          }
-        }
-      }
-
-      if (this.isRoadPixel(nx,ny)) {
-        if (Math.abs(t.dir.x) > 0){
-          const use = (cNext.gx!==cNow.gx && cNext.gy===cNow.gy) ? cNext : cNow;
-          ny = lanePositionFor(use.gx, use.gy, t.dir, false).y;
-        } else {
-          const use = (cNext.gy!==cNow.gy && cNext.gx===cNow.gx) ? cNext : cNow;
-          nx = lanePositionFor(use.gx, use.gy, t.dir, false).x;
-        }
-
-        const ahead = this._carAheadSameLane(t);
-        if (ahead){
-          if (this._maybeRearEnd(t, ahead, dt)) {
-            if (t._flagCrashed){
-              t.spr.destroy();
-              this.traffic.splice(i,1);
-              continue;
-            }
-          }
-          const cl = this._applyFollowGapClamp(t, nx, ny, ahead);
-          nx = cl.nx; ny = cl.ny;
-        }
-
-        if (cNext.gx!==cNow.gx || cNext.gy!==cNow.gy) this.markLanePass(cNext.gx, cNext.gy, t.dir, nowSec);
-        t.spr.x = nx; t.spr.y = ny;
-        continue;
-      }
-
-      // choose next direction
-      const options=[];
-      if (this.isRoadCell(cNow.gx+1,cNow.gy)) options.push(vec(1,0));
-      if (this.isRoadCell(cNow.gx-1,cNow.gy)) options.push(vec(-1,0));
-      if (this.isRoadCell(cNow.gx,cNow.gy+1)) options.push(vec(0,1));
-      if (this.isRoadCell(cNow.gx,cNow.gy-1)) options.push(vec(0,-1));
-
-      const back = vec(-t.dir.x,-t.dir.y);
-      const candidates = options.filter(v => !(v.x===back.x && v.y===back.y));
-      const fwd = vec(t.dir.x,t.dir.y);
-      let picked = candidates.find(v => v.x===fwd.x && v.y===fwd.y) ||
-                   candidates[(Math.random()*candidates.length)|0] ||
-                   options[(Math.random()*options.length)|0];
-
-      if (picked){
-        const gx2=cNow.gx+picked.x, gy2=cNow.gy+picked.y;
-        if (!this.canEnterLane(gx2, gy2, picked, nowSec)) {
-          if (Math.random() < (t.ignoreYield||0)) {
-            this.markLanePass(gx2, gy2, picked, nowSec);
-            t.dir.set(picked.x,picked.y);
-            const edge = this.edgePosition(cNow.gx, cNow.gy, t.dir);
-            t.spr.setPosition(edge.x, edge.y);
-          } else {
-            t.wait=YIELD_PAUSE_SEC;
-          }
-        } else {
-          t.dir.set(picked.x,picked.y);
-          const edge = this.edgePosition(cNow.gx, cNow.gy, t.dir);
-          t.spr.setPosition(edge.x, edge.y);
-          this.markLanePass(gx2,gy2,t.dir,nowSec);
-        }
-      } else {
-        this.spawnCrash(t.spr.x, t.spr.y);
-        t.spr.destroy(); this.traffic.splice(i,1);
-      }
-    }
-    if (this.apb) this._nextFlickerAt = this.time.now + (1000/this._flickerHz);
-
-    // Keep entities on top as traffic changes
-    this._refreshEntityDepths();
-  }
 
   // ——— APB cop routing helpers ———
   _copRouteReset(){
@@ -1662,9 +847,9 @@ export default class CityScene extends Phaser.Scene {
   }
   _centerOf(gx,gy){ return { x: gx*TILE + TILE/2, y: gy*TILE + TILE/2 }; }  // Grid-relative
   _planRouteToCar(){
-    const start = this.pixToCell(this.cop.x, this.cop.y);
-    const goal  = this.pixToCell(this.car.x, this.car.y);
-    if (!this.isRoadCell(start.gx,start.gy) || !this.isRoadCell(goal.gx,goal.gy)) return false;
+    const start = this.gridSystem.pixToCell(this.cop.x, this.cop.y);
+    const goal  = this.gridSystem.pixToCell(this.car.x, this.car.y);
+    if (!this.gridSystem.isRoadCell(start.gx,start.gy) || !this.gridSystem.isRoadCell(goal.gx,goal.gy)) return false;
     const path = this._bfsPath(start, goal);
     if (!path || path.length<2) return false;
     this.copRoute = path;
@@ -1677,13 +862,13 @@ export default class CityScene extends Phaser.Scene {
     if (!this.copRoute) return false;
     if (this.copRouteIdx >= this.copRoute.length) return false;
 
-    const cur = this.pixToCell(this.cop.x, this.cop.y);
+    const cur = this.gridSystem.pixToCell(this.cop.x, this.cop.y);
     const tgt = this.copRoute[this.copRouteIdx];
     const dx = Math.sign(tgt.gx - cur.gx);
     const dy = Math.sign(tgt.gy - cur.gy);
     const dir = (Math.abs(dx) > 0) ? {x:dx,y:0} : {x:0,y:dy};
 
-    const pos = lanePositionFor(tgt.gx, tgt.gy, dir, this.isRoundaboutCell(tgt.gx, tgt.gy));
+    const pos = lanePositionFor(tgt.gx, tgt.gy, dir, this.gridSystem.isRoundaboutCell(tgt.gx, tgt.gy));
     const v = new Phaser.Math.Vector2(pos.x - this.cop.x, pos.y - this.cop.y);
     const dist = v.length();
     if (dist < WAYPOINT_RADIUS_PX){
@@ -1693,8 +878,8 @@ export default class CityScene extends Phaser.Scene {
     if (dist > 1){
       v.normalize().scale(this.copSpeed*dt);
       const nx=this.cop.x+v.x, ny=this.cop.y+v.y;
-      if (this.isRoadPixel(nx,this.cop.y)) this.cop.x=nx;
-      if (this.isRoadPixel(this.cop.x,ny)) this.cop.y=ny;
+      if (this.gridSystem.isRoadPixel(nx,this.cop.y)) this.cop.x=nx;
+      if (this.gridSystem.isRoadPixel(this.cop.x,ny)) this.cop.y=ny;
       
       // Update cop rotation to face movement direction
       const angle = Phaser.Math.Angle.Between(0, 0, v.x, v.y);
@@ -1708,6 +893,7 @@ export default class CityScene extends Phaser.Scene {
     window.removeEventListener("storage", this._storageHandler);
     if (this._onApbStatus) window.removeEventListener("apb:status", this._onApbStatus);
     this.copRingTween?.stop();
+    if (this.trafficSystem) this.trafficSystem.destroy();
   }
   destroy(){ this.shutdown(); super.destroy(); }
 
@@ -1726,15 +912,15 @@ export default class CityScene extends Phaser.Scene {
       v.normalize().scale(this.carSpeed*dt);
       let nx=this.car.x+v.x, ny=this.car.y+v.y;
 
-      if (this.isRoadPixel(nx,ny)){ this.car.x=nx; this.car.y=ny; }
-      else { if (this.isRoadPixel(nx,this.car.x)) this.car.x=nx; if (this.isRoadPixel(this.car.x,ny)) this.car.y=ny; }
+      if (this.gridSystem.isRoadPixel(nx,ny)){ this.car.x=nx; this.car.y=ny; }
+      else { if (this.gridSystem.isRoadPixel(nx,this.car.x)) this.car.x=nx; if (this.gridSystem.isRoadPixel(this.car.x,ny)) this.car.y=ny; }
 
       this.lastCarDir.set(Math.sign(v.x||0), Math.sign(v.y||0));
       const ang = Phaser.Math.Angle.Between(0,0,v.x,v.y);
       this.car.setRotation(ang + CAR_ROT_OFFSET);
 
-      const { gx, gy } = this.pixToCell(this.car.x, this.car.y);
-      if (this.isRoadCell(gx, gy)) {
+      const { gx, gy } = this.gridSystem.pixToCell(this.car.x, this.car.y);
+      if (this.gridSystem.isRoadCell(gx, gy)) {
         const snap = laneSnapPoint(gx, gy, this.lastCarDir, this.car.x, this.car.y);
         const offX = snap.x - this.car.x;
         const offY = snap.y - this.car.y;
@@ -1747,7 +933,7 @@ export default class CityScene extends Phaser.Scene {
           if (Math.abs(offY) > EDGE_PUSH_PIX) this.car.y += Math.sign(offY) * Math.min(push, Math.abs(offY));
         }
       }
-      this.revealAtCurrentCell(false);
+      this.revealSystem.revealAtCurrentCell(false);
       this._mmDirty = true;
 
       // Keep player on top as it moves (just in case)
@@ -1789,8 +975,8 @@ export default class CityScene extends Phaser.Scene {
         if (chase.lengthSq()>1){
           chase.normalize().scale(this.copSpeed*dt);
           const nx=this.cop.x+chase.x, ny=this.cop.y+chase.y;
-          if (this.isRoadPixel(nx,this.cop.y)) this.cop.x=nx;
-          if (this.isRoadPixel(this.cop.x,ny)) this.cop.y=ny;
+          if (this.gridSystem.isRoadPixel(nx,this.cop.y)) this.cop.x=nx;
+          if (this.gridSystem.isRoadPixel(this.cop.x,ny)) this.cop.y=ny;
           
           // Update cop rotation to face chase direction
           const angle = Phaser.Math.Angle.Between(0, 0, chase.x, chase.y);
@@ -1815,7 +1001,7 @@ export default class CityScene extends Phaser.Scene {
           total: stash,
         };
         this.apb=false; this.apbRemaining=0; this.hideCop(); this._copRouteReset();
-        for (const t of this.traffic) t.spr.setTint(0xbfd1ff);
+        for (const t of this.trafficSystem.traffic) t.spr.setTint(0xbfd1ff);
         this.updateCityHud();
         this.showApbSummary(stats);
       }
@@ -1839,7 +1025,7 @@ export default class CityScene extends Phaser.Scene {
           total: (stash + bonus + evasion)|0,
         };
         this.apb=false; this.hideCop(); this._copRouteReset();
-        for (const t of this.traffic) t.spr.setTint(0xbfd1ff);
+        for (const t of this.trafficSystem.traffic) t.spr.setTint(0xbfd1ff);
         this.updateCityHud();
         this.showApbSummary(stats);
       }
@@ -1855,14 +1041,11 @@ export default class CityScene extends Phaser.Scene {
       }
     }
 
-    // traffic
-    this.stepTraffic(dt);
-
     // APB intensity ramp
     if (this.apb){
       this._apbSpawnCarry += APB_RAMP_SPAWNS_PER_SEC * dt;
       while (this._apbSpawnCarry >= 1){
-        this.spawnTraffic();
+        this.trafficSystem.spawnTraffic();
         this._apbSpawnCarry -= 1;
       }
     } else {
@@ -1873,13 +1056,13 @@ export default class CityScene extends Phaser.Scene {
     if (!this._carGraceUntil || this.time.now >= this._carGraceUntil) {
       const carX = this.car.x, carY = this.car.y;
       let pickedIdx = -1;
-      for (let i = 0; i < this.traffic.length; i++) {
-        const t = this.traffic[i];
+      for (let i = 0; i < this.trafficSystem.traffic.length; i++) {
+        const t = this.trafficSystem.traffic[i];
         const d2 = Phaser.Math.Distance.Squared(carX, carY, t.spr.x, t.spr.y);
         if (d2 < 12*12) { pickedIdx = i; break; }
       }
       if (pickedIdx >= 0) {
-        const t = this.traffic[pickedIdx];
+        const t = this.trafficSystem.traffic[pickedIdx];
         if (this.apb) {
           const reward = this.apbHitReward|0; // 1 or 2, frozen at start
           addCoins(reward);
@@ -1891,13 +1074,16 @@ export default class CityScene extends Phaser.Scene {
           this.makePopup(t.spr.x, t.spr.y - 10, `•`, 0x9fb4c8);
         }
         t.spr.destroy();
-        this.traffic.splice(pickedIdx, 1);
+        this.trafficSystem.traffic.splice(pickedIdx, 1);
         this._carGraceUntil = this.time.now + 220;
       }
     }
 
+    // Update traffic AI
+    this.trafficSystem.update(this.time.now, delta);
+
     if (this.time.now >= this._nextHudAt) { this.updateCityHud(); this._nextHudAt = this.time.now + 300; }
-    if (this.minimapOn) this.drawMinimap(false);
+    if (this.minimapOn) this.renderSystem.drawMinimap(false);
 
     if (this._needReload && !this._reloadLock){
       this._reloadLock=true; this._needReload=false;
@@ -1905,52 +1091,6 @@ export default class CityScene extends Phaser.Scene {
     }
   }
 
-  drawMinimap(force){
-    if (!this.minimapOn || !this.uiCam || (this.sys && this.sys.isDestroyed)) return;
-    const now = this.time.now;
-    const overlayInterval = 1000 / this._mmOverlayHz;
-
-    const scale = MM_SCALES[this.mmScaleIdx] || MM_SCALES[0];
-    const tile = Math.max(3, Math.round(MM_TILE_BASE*scale));
-    const w=this.w*tile, h=this.h*tile;
-
-    let x=this.mmPos.x, y=this.mmPos.y;
-    if (x==null || y==null){
-      x=this.scale.width-w-MM_PAD-6; y=MM_PAD+TOP_UI_OFFSET; this.mmPos={x,y};
-    }
-
-    if (force || this._mmDirty) {
-      const g = this.minimapBack;
-      g.clear();
-      g.fillStyle(0x0b0e12,0.68).fillRoundedRect(x-6,y-6,w+12,h+12,8);
-      g.lineStyle(1, 0x3a3f46, 0.9).strokeRoundedRect(x-6,y-6,w+12,h+12,8);
-
-      for (let gy=0;gy<this.h;gy++) for (let gx=0;gx<this.w;gx++){
-        const b=normBase(this.grid[gy]?.[gx]);
-        let col=0x1f232a;
-        if (b==="road") col=0x3a3a3a; else if (b==="avenue") col=0x747474; else if (b==="roundabout") col=0x8a6d2b;
-        else if (b==="home"||b==="house") col=0x6b5e4a; else if (b==="shop") col=0x5b7bd8; else if (b==="park") col=0x2c8c4a;
-        else if (b==="hq") col=0xb24a5c; else if (b==="start") col=0xe0a134;
-        if (!this.isRevealed(gx,gy)) col=0x0b0b0b;
-        g.fillStyle(col,1).fillRect(x+gx*tile, y+gy*tile, tile, tile);
-      }
-
-      this.mmZone.setPosition(x-6,y-6).setSize(w+12,h+12);
-      this._mmDirty = false;
-      this._mmNextOverlayAt = 0;
-    }
-
-    if (now >= this._mmNextOverlayAt) {
-      const og = this.minimapOverlay; og.clear();
-      const pc=this.pixToCell(this.car.x,this.car.y);
-      og.fillStyle(0xffcc66,1).fillRect(x+pc.gx*tile, y+pc.gy*tile, tile, tile);
-      if (this.apb && this.cop?.visible){
-        const cc=this.pixToCell(this.cop.x,this.cop.y);
-        og.fillStyle(0xff5577,1).fillRect(x+cc.gx*tile, y+cc.gy*tile, tile, tile);
-      }
-      this._mmNextOverlayAt = now + overlayInterval;
-    }
-  }
 
   reloadFromActiveLayout(force=false){
     const sim=loadActiveLayout(); const hash=safeHash(sim);
@@ -1961,18 +1101,18 @@ export default class CityScene extends Phaser.Scene {
     this.applySim(sim.grid, sim.w, sim.h);
     this._buildRoadGraph();
 
-    this.revealKey = makePerSlotKey(REVEAL_KEY_BASE, this.activeSlotId);
-    this.reveal = this.loadReveal();
+    // Reload reveal system with new slot ID
+    this.revealSystem.reload();
     this.mmScaleIdx = Number(lsGet(makePerSlotKey(MM_SCALE_KEY_BASE, this.activeSlotId), 0)) || 0;
     this.mmPos = lsGet(makePerSlotKey(MM_POS_KEY_BASE, this.activeSlotId), { x:null, y:null });
 
-    this.drawWorld();
+    this.renderSystem.drawWorld();
     const spawn=this.findStart()||{x:TILE,y:TILE};
     // Grid-relative position, maintain high depth
     this.car.setPosition(spawn.x+TILE/2, spawn.y+TILE/2).setDepth(100).setVisible(true);
     if (this.apb) this.spawnCop?.();
-    this.updateCityHud(); this.drawFog(); this.revealAtCurrentCell(true);
-    this._mmDirty = true; this.drawMinimap(true);
+    this.updateCityHud(); this.revealSystem.drawFog(); this.revealSystem.revealAtCurrentCell(true);
+    this._mmDirty = true; this.renderSystem.drawMinimap(true);
 
     // Make sure ordering is still correct after reload
     this._refreshEntityDepths();
