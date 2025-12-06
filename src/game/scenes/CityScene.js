@@ -16,6 +16,8 @@ import { RevealSystem } from "./systems/RevealSystem.js";
 import { NavigationSystem, lanePointInCell, laneSnapPoint, entryPosition, turnType } from "./systems/NavigationSystem.js";
 import { RenderSystem } from "./systems/RenderSystem.js";
 import { TrafficSystem } from "./systems/TrafficSystem.js";
+import { CopSystem } from './systems/CopSystem.js';
+import { SystemManager } from './systems/SystemManager.js';
 
 let citySlots = null;
 try {
@@ -150,7 +152,7 @@ const CHAOS_CRASH_BASE = 0.020;
 
 // visuals
 const CAR_ROT_OFFSET = Math.PI / 2;
-// Muted ground / park colors so the city feels less “loud”
+// Muted ground / park colors so the city feels less "loud"
 const GRASS_TINT  = 0x4a5a3a;
 const GRASS_ALPHA = 0.9;
 const PARK_COLOR  = 0x225233;
@@ -218,7 +220,8 @@ function loadFromSlots() {
   if (!citySlots?.loadSim) return null;
   try {
     const active = citySlots.getActiveSlot?.() || null;
-    const sim = citySlots.loadSim();
+    // Explicitly load the active slot’s layout
+    const sim = active ? citySlots.loadSim(active) : citySlots.loadSim();
     if (sim?.grid?.length) {
       const w = sim.grid[0]?.length || 0;
       const h = sim.grid.length;
@@ -269,11 +272,13 @@ function pickPersonaKey(){
 export default class CityScene extends Phaser.Scene {
   constructor(){ 
     super("CityScene");
-    this.gridSystem = null; // Initialized in applySim()
-    this.revealSystem = null; // Initialized in init()
-    this.navigationSystem = null; // Initialized in init()
-    this.renderSystem = null; // Initialized in create()
-    this.trafficSystem = null; // Initialized in create()
+    this.systemManager = null;
+    this.gridSystem = null;
+    this.revealSystem = null;
+    this.navigationSystem = null;
+    this.renderSystem = null;
+    this.trafficSystem = null;
+    this.copSystem = null;
   }
 
   init(){
@@ -298,12 +303,29 @@ export default class CityScene extends Phaser.Scene {
     this.minimapOn = true;
     this.mmPos = lsGet(makePerSlotKey(MM_POS_KEY_BASE, this.activeSlotId), { x: null, y: null });
 
-    // Initialize RevealSystem (fog of war)
-    this.revealSystem = new RevealSystem(this);
-    
-    // Initialize NavigationSystem (turn logic)
-    this.navigationSystem = new NavigationSystem(this);
+    // ===== SystemManager Setup =====
+    this.systemManager = new SystemManager(this);
 
+    this.systemManager.register([
+      { name: 'grid', class: GridSystem },
+      { name: 'navigation', class: NavigationSystem },
+      { name: 'reveal', class: RevealSystem, deps: ['grid'] },
+      { name: 'render', class: RenderSystem, deps: ['grid', 'reveal'] },
+      { name: 'traffic', class: TrafficSystem, deps: ['grid', 'navigation'] },
+      { name: 'cop', class: CopSystem, deps: ['grid', 'navigation'] }
+    ]);
+
+    // Initialize all systems (handles dependencies automatically)
+    this.systemManager.initializeAll().then(() => {
+      this.gridSystem = this.systemManager.getSystem('grid');
+      this.navigationSystem = this.systemManager.getSystem('navigation');
+      this.revealSystem = this.systemManager.getSystem('reveal');
+      this.renderSystem = this.systemManager.getSystem('render');
+      this.trafficSystem = this.systemManager.getSystem('traffic');
+      this.copSystem = this.systemManager.getSystem('cop');
+      
+      console.log('[SystemManager] All systems ready!');
+    });
 
     // APB runtime state
     this.apb = false;
@@ -312,13 +334,7 @@ export default class CityScene extends Phaser.Scene {
     this.apbHits = 0;
     this.apbHitReward = 1;
 
-    // cop routing state
-    this.copRoute = null;
-    this.copRouteIdx = 0;
-    this._copNextReplanAt = 0;
-    this._copLastDist = Infinity;
-    this._copStallSec = 0;
-    this._copLastSeenCar = { x: 0, y: 0 };
+
 
     // APB summary/ramp trackers
     this._apbStartedAt = 0;
@@ -336,9 +352,6 @@ export default class CityScene extends Phaser.Scene {
     this._maxDt = 0.050;
     this._nextFlickerAt = 0;
     this._flickerHz = 12;
-
-    // precompute road graph
-    this._buildRoadGraph();
   }
 
   applySim(gridIn, wIn, hIn){
@@ -355,51 +368,6 @@ export default class CityScene extends Phaser.Scene {
     
     // Initialize GridSystem with scene reference
     this.gridSystem = new GridSystem(this);
-  }
-
-  // ——— road graph + BFS ———
-  _buildRoadGraph(){
-    const adj = new Map();
-    const ok = (x,y)=> this.gridSystem.isRoadCell(x,y);
-    const add = (a,b) => { const k = cellKey(a.gx,a.gy); if(!adj.has(k)) adj.set(k,[]); adj.get(k).push(b); };
-    for (let gy=0; gy<this.h; gy++){
-      for (let gx=0; gx<this.w; gx++){
-        if (!ok(gx,gy)) continue;
-        const here = { gx, gy };
-        for (const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){
-          const nx=gx+dx, ny=gy+dy;
-          if (ok(nx,ny)) add(here,{gx:nx,gy:ny});
-        }
-      }
-    }
-    this._roadAdj = adj;
-  }
-  _bfsPath(start, goal){
-    if (!start || !goal) return null;
-    const sk = cellKey(start.gx,start.gy), gk = cellKey(goal.gx,goal.gy);
-    if (sk===gk) return [start];
-    const q=[sk], prev=new Map(); prev.set(sk,null);
-    let steps=0;
-    while(q.length && steps < ROUTE_MAX_STEPS){
-      const k=q.shift();
-      if (k===gk) break;
-      const neigh = (this._roadAdj.get(k)||[]);
-      for(const n of neigh){
-        const nk = cellKey(n.gx,n.gy);
-        if (prev.has(nk)) continue;
-        prev.set(nk,nk===sk?null:k);
-        q.push(nk);
-      }
-      steps++;
-    }
-    if (!prev.has(gk)) return null;
-    const path=[];
-    for(let cur=gk; cur; cur=prev.get(cur)){
-      const [gx,gy]=cur.split(",").map(Number);
-      path.push({gx,gy});
-    }
-    path.reverse();
-    return path;
   }
 
   // lane occupancy helpers
@@ -461,26 +429,28 @@ export default class CityScene extends Phaser.Scene {
     window.addEventListener("apb:status", this._onApbStatus);
 
     // layers
-    this.worldLayer = this.add.container(0, 0);
+    this.worldLayer = this.add.container(PADDING, PADDING);
     this.uiLayer = this.add.container(0, 0).setDepth(100000);
     worldCam.ignore(this.uiLayer);
     this.uiCam.ignore(this.worldLayer);
 
     // world graphics
-    this.worldGfx = this.add.graphics().setPosition(PADDING, PADDING).setDepth(1);
-    this.roadDetailGfx = this.add.graphics().setPosition(PADDING, PADDING).setDepth(2);
+    this.worldGfx = this.add.graphics().setPosition(0, 0).setDepth(1);
+    this.roadDetailGfx = this.add.graphics().setPosition(0, 0).setDepth(2);
     this.fogGfx = this.add.graphics().setDepth(3);
     this.worldLayer.add([this.worldGfx, this.roadDetailGfx, this.fogGfx]);
+
+    // Wait for SystemManager to finish initializing
+    if (!this.gridSystem || !this.renderSystem || !this.trafficSystem || !this.copSystem) {
+      this.time.delayedCall(100, () => this.create());
+      return;
+    }
     
     // Connect fog graphics to RevealSystem
     this.revealSystem.setFogGraphics(this.fogGfx);
 
-    // Initialize RenderSystem
-    this.renderSystem = new RenderSystem(this);
-
-    // Initialize TrafficSystem
-    this.trafficSystem = new TrafficSystem(this);
-    this.trafficSystem.initialize(); // Set up spawn timer
+    // Systems ready - initialize traffic spawn timer
+    this.trafficSystem.initialize();
     
     // player + cop  
     const spawn = this.findStart() || { x: TILE, y: TILE };
@@ -577,22 +547,9 @@ export default class CityScene extends Phaser.Scene {
 
     // APB helpers
     this.spawnCop = () => {
-      let r = this.randomRoadPixel();
-      if (!r) {
-        const { gx, gy } = this.gridSystem.pixToCell(this.car.x, this.car.y);
-        r = { x: gx*TILE, y: gy*TILE };
-      }
-      // Grid-relative position
-      this.cop.setPosition(r.x + TILE/2, r.y + TILE/2).setVisible(true);
-      this.copRing.setPosition(this.cop.x, this.cop.y).setVisible(true);
-      this.copRingTween?.stop();
-      this.copRingTween = this.tweens.add({
-        targets: this.copRing, scale: { from: 1, to: 1.25 }, alpha: { from: 0.28, to: 0.10 },
-        duration: 700, yoyo: true, repeat: -1, ease: "Sine.easeInOut",
-      });
-      this._refreshEntityDepths();
+      this.copSystem.spawn();
     };
-    this.hideCop = () => { this.cop.setVisible(false); this.copRing.setVisible(false); this.copRingTween?.stop(); };
+    this.hideCop = () => { this.copSystem.hide(); };
 
     this.startApb = ({ doMark = true } = {}) => {
       if (this.apb) return false;
@@ -609,7 +566,29 @@ export default class CityScene extends Phaser.Scene {
       this._apbSpawnCarry = 0;
       this.spawnCop();
       for (const t of this.trafficSystem.traffic) t.spr.setTint(0xffea76);
-      this._copRouteReset();
+      
+      // Listen for cop catch event
+      this._copCaughtHandler = () => {
+        if (!this.apb) return;
+        this.makePopup(this.car.x, this.car.y - 12, `caught`, 0xff3355);
+        const durationSec = Math.max(0, Math.round((this.time.now - this._apbStartedAt)/1000));
+        const stash = this.apbBaseEarned|0;
+        const stats = {
+          result: "caught",
+          durationSec,
+          hits: this.apbHits|0,
+          hitCoins: stash,
+          bonus: 0,
+          evasion: 0,
+          total: stash,
+        };
+        this.apb=false; this.apbRemaining=0; this.hideCop();
+        for (const t of this.trafficSystem.traffic) t.spr.setTint(0xbfd1ff);
+        this.updateCityHud();
+        this.showApbSummary(stats);
+      };
+      this.copSystem.on('cop:caught', this._copCaughtHandler);
+      
       this.updateCityHud();
       return true;
     };
@@ -675,6 +654,9 @@ export default class CityScene extends Phaser.Scene {
       case "stacked": this.carSpeed = CAR_SPEED_STACK; this.copSpeed = COP_SPEED_STACK; break;
       case "boosted": this.carSpeed = CAR_SPEED_BOOST; this.copSpeed = COP_SPEED_BOOST; break;
       default: this.carSpeed = CAR_SPEED_IDLE; this.copSpeed = COP_SPEED_IDLE; break;
+    }
+    if (this.copSystem) {
+      this.copSystem.setSpeed(this.prodState);
     }
   }
 
@@ -836,64 +818,19 @@ export default class CityScene extends Phaser.Scene {
 
 
 
-  // ——— APB cop routing helpers ———
-  _copRouteReset(){
-    this.copRoute = null;
-    this.copRouteIdx = 0;
-    this._copNextReplanAt = 0;
-    this._copLastDist = Infinity;
-    this._copStallSec = 0;
-    this._copLastSeenCar = { x: this.car.x, y: this.car.y };
-  }
-  _centerOf(gx,gy){ return { x: gx*TILE + TILE/2, y: gy*TILE + TILE/2 }; }  // Grid-relative
-  _planRouteToCar(){
-    const start = this.gridSystem.pixToCell(this.cop.x, this.cop.y);
-    const goal  = this.gridSystem.pixToCell(this.car.x, this.car.y);
-    if (!this.gridSystem.isRoadCell(start.gx,start.gy) || !this.gridSystem.isRoadCell(goal.gx,goal.gy)) return false;
-    const path = this._bfsPath(start, goal);
-    if (!path || path.length<2) return false;
-    this.copRoute = path;
-    this.copRouteIdx = 1;
-    this._copNextReplanAt = this.time.now/1000 + REPLAN_EVERY_SEC;
-    this._copLastSeenCar = { x: this.car.x, y: this.car.y };
-    return true;
-  }
-  _followRoute(dt){
-    if (!this.copRoute) return false;
-    if (this.copRouteIdx >= this.copRoute.length) return false;
-
-    const cur = this.gridSystem.pixToCell(this.cop.x, this.cop.y);
-    const tgt = this.copRoute[this.copRouteIdx];
-    const dx = Math.sign(tgt.gx - cur.gx);
-    const dy = Math.sign(tgt.gy - cur.gy);
-    const dir = (Math.abs(dx) > 0) ? {x:dx,y:0} : {x:0,y:dy};
-
-    const pos = lanePositionFor(tgt.gx, tgt.gy, dir, this.gridSystem.isRoundaboutCell(tgt.gx, tgt.gy));
-    const v = new Phaser.Math.Vector2(pos.x - this.cop.x, pos.y - this.cop.y);
-    const dist = v.length();
-    if (dist < WAYPOINT_RADIUS_PX){
-      this.copRouteIdx++;
-      return true;
-    }
-    if (dist > 1){
-      v.normalize().scale(this.copSpeed*dt);
-      const nx=this.cop.x+v.x, ny=this.cop.y+v.y;
-      if (this.gridSystem.isRoadPixel(nx,this.cop.y)) this.cop.x=nx;
-      if (this.gridSystem.isRoadPixel(this.cop.x,ny)) this.cop.y=ny;
-      
-      // Update cop rotation to face movement direction
-      const angle = Phaser.Math.Angle.Between(0, 0, v.x, v.y);
-      this.cop.setRotation(angle + CAR_ROT_OFFSET);
-    }
-    return true;
-  }
-
   shutdown(){
     this.unsubBoost?.();
     window.removeEventListener("storage", this._storageHandler);
     if (this._onApbStatus) window.removeEventListener("apb:status", this._onApbStatus);
-    this.copRingTween?.stop();
-    if (this.trafficSystem) this.trafficSystem.destroy();
+    
+    if (this._copCaughtHandler && this.copSystem) {
+      this.copSystem.off('cop:caught', this._copCaughtHandler);
+    }
+    
+    // Destroy all systems via SystemManager
+    if (this.systemManager) {
+      this.systemManager.destroy();
+    }
   }
   destroy(){ this.shutdown(); super.destroy(); }
 
@@ -944,68 +881,11 @@ export default class CityScene extends Phaser.Scene {
     if (this.apb){
       this.apbRemaining = Math.max(0, this.apbRemaining - dt);
 
-      const distNow = Phaser.Math.Distance.Between(this.car.x,this.car.y,this.cop.x,this.cop.y);
+      // Update cop ring position
+      this.copRing.setPosition(this.cop.x, this.cop.y);
 
-      if (distNow + 0.5 < this._copLastDist) {
-        this._copStallSec = 0;
-        this._copLastDist = distNow;
-      } else {
-        this._copStallSec += dt;
-      }
-
-      const carDelta = Phaser.Math.Distance.Between(this._copLastSeenCar.x, this._copLastSeenCar.y, this.car.x, this.car.y);
-
-      const nowSec = this.time.now/1000;
-      const needReplan =
-        (this._copStallSec >= STALL_SECONDS) ||
-        (this.copRoute && (nowSec >= this._copNextReplanAt)) ||
-        (this.copRoute && carDelta >= CAR_ROUTE_RETARGET);
-
-      if (needReplan) {
-        if (!this._planRouteToCar()) {
-          this._copNextReplanAt = nowSec + 0.6;
-        } else {
-          this._copStallSec = 0;
-          this._copLastDist = distNow;
-        }
-      }
-
-      if (!(this.copRoute && this._followRoute(dt))) {
-        const chase = new Phaser.Math.Vector2(this.car.x - this.cop.x, this.car.y - this.cop.y);
-        if (chase.lengthSq()>1){
-          chase.normalize().scale(this.copSpeed*dt);
-          const nx=this.cop.x+chase.x, ny=this.cop.y+chase.y;
-          if (this.gridSystem.isRoadPixel(nx,this.cop.y)) this.cop.x=nx;
-          if (this.gridSystem.isRoadPixel(this.cop.x,ny)) this.cop.y=ny;
-          
-          // Update cop rotation to face chase direction
-          const angle = Phaser.Math.Angle.Between(0, 0, chase.x, chase.y);
-          this.cop.setRotation(angle + CAR_ROT_OFFSET);
-        }
-      }
-
-      this.copRing.setPosition(this.cop.x,this.cop.y);
-      const caught = Phaser.Math.Distance.Between(this.car.x,this.car.y,this.cop.x,this.cop.y) < 16;
-
-      if (caught){
-        this.makePopup(this.car.x, this.car.y - 12, `caught`, 0xff3355);
-        const durationSec = Math.max(0, Math.round((this.time.now - this._apbStartedAt)/1000));
-        const stash = this.apbBaseEarned|0;
-        const stats = {
-          result: "caught",
-          durationSec,
-          hits: this.apbHits|0,
-          hitCoins: stash,
-          bonus: 0,
-          evasion: 0,
-          total: stash,
-        };
-        this.apb=false; this.apbRemaining=0; this.hideCop(); this._copRouteReset();
-        for (const t of this.trafficSystem.traffic) t.spr.setTint(0xbfd1ff);
-        this.updateCityHud();
-        this.showApbSummary(stats);
-      }
-      else if (this.apbRemaining<=0){
+      // Check if time ran out (evaded)
+      if (this.apbRemaining<=0){
         const durationSec = Math.max(0, Math.round((this.time.now - this._apbStartedAt)/1000));
         const stash = this.apbBaseEarned|0;
         const hits  = this.apbHits|0;
@@ -1024,7 +904,7 @@ export default class CityScene extends Phaser.Scene {
           evasion,
           total: (stash + bonus + evasion)|0,
         };
-        this.apb=false; this.hideCop(); this._copRouteReset();
+        this.apb=false; this.hideCop();
         for (const t of this.trafficSystem.traffic) t.spr.setTint(0xbfd1ff);
         this.updateCityHud();
         this.showApbSummary(stats);
@@ -1079,8 +959,10 @@ export default class CityScene extends Phaser.Scene {
       }
     }
 
-    // Update traffic AI
-    this.trafficSystem.update(this.time.now, delta);
+    // Update all systems via SystemManager
+    if (this.systemManager) {
+      this.systemManager.update(this.time.now, delta);
+    }
 
     if (this.time.now >= this._nextHudAt) { this.updateCityHud(); this._nextHudAt = this.time.now + 300; }
     if (this.minimapOn) this.renderSystem.drawMinimap(false);

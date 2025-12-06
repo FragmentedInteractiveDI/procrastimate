@@ -1,57 +1,17 @@
 // FILE: src/screens/CityBuilder.jsx
+// FINAL FIX - Proper bootstrap without charging coins + single-click placement
+
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import {
-  getInventory,
-  consume,
-  addItem,
-  setInventory,
-  getStarterInventory,
-} from "../modules/buildInventory";
-import {
-  listSlots,
-  getActiveSlot,
-  setActiveSlot,
-  loadSim,
-  saveSim,
-  createSlot,
-  deleteSlot,
-  renameSlot,
-} from "../modules/citySlots";
-import {
-  spendMate,
-  getWallet,
-  fmtUSD,
-  convertCoinsToUsd,
-} from "../modules/wallet";
+import * as buildInventory from "../modules/buildInventory";
+import * as walletModule from "../modules/wallet";
+import * as citySlots from "../modules/citySlots";
+import { BuilderManager } from "../game/builder/BuilderManager.js";
+import { getWallet, fmtUSD, convertCoinsToUsd } from "../modules/wallet";
 
-/* ---------- tileset (Start is not exposed) ---------- */
-const TILESET = [
-  { id: "road",       color: "#6b7280", icon: "🛣️" },
-  { id: "avenue",     color: "#9ca3af", icon: "🛣️" },
-  { id: "roundabout", color: "#a3a3a3", icon: "↻"  },
-  { id: "house",      color: "#f59e0b", icon: "🏠" },
-  { id: "home",       color: "#fdba74", icon: "🏡" },
-  { id: "park",       color: "#34d399", icon: "🌳" },
-  { id: "shop",       color: "#60a5fa", icon: "🏬" },
-  { id: "hq",         color: "#93c5fd", icon: "🏢" },
+const CELL = 32;
 
-  // new buildings
-  { id: "apb",        color: "#fb7185", icon: "🚓" },
-  { id: "bank",       color: "#eab308", icon: "🏦" },
-  { id: "garage",     color: "#38bdf8", icon: "🚗" },
-  { id: "paintshop",  color: "#f97316", icon: "🎨" },
-];
-const PALETTE = Object.fromEntries(
-  TILESET.map((t) => [t.id, { color: t.color, icon: t.icon }])
-);
-const normalizeId = (id) =>
-  id === "r" ? "road"
-  : id === "av" ? "avenue"
-  : (id === "rb" || id === "round" || id === "ra") ? "roundabout"
-  : (id === "st" || id === "start") ? "home"
-  : id;
+/* ---------- Helpers ---------- */
 
-/* ---------- placement rules & costs ---------- */
 const ROADLIKE = new Set(["road", "avenue", "roundabout"]);
 const BUILDINGS = new Set([
   "home",
@@ -65,332 +25,479 @@ const BUILDINGS = new Set([
   "paintshop",
 ]);
 
-// Mate costs (per placement). Flat fee; tune as needed.
-// IMPORTANT: these only apply AFTER inventory for that tile is exhausted.
-const COST_MATE = {
-  road:       5,
-  avenue:     8,
-  roundabout: 15,
-  park:       6,
-  // buildings like house/home/shop/hq/apb/bank/garage/paintshop are currently free in Mate
-};
-
-/* ---------- grid unlock model (for USD Store upgrades) ---------- */
-// LocalStorage key controlled by Store upgrades; 0 = base 6×6, each level +1 size
-const GRID_LEVEL_KEY = "pm_build_grid_level_v1";
-const BASE_UNLOCK_SIZE = 6;
-
-function getGridLevelFromStorage() {
-  if (typeof window === "undefined") return 0;
-  try {
-    const v = Number(localStorage.getItem(GRID_LEVEL_KEY) || "0");
-    if (!Number.isFinite(v) || v < 0) return 0;
-    return Math.floor(v);
-  } catch {
-    return 0;
-  }
+function clamp(v, a, b) {
+  return Math.max(a, Math.min(b, v));
 }
 
-/**
- * Compute the unlocked rectangle (central box) for a given grid + level.
- * Size starts at BASE_UNLOCK_SIZE × BASE_UNLOCK_SIZE and grows by 1
- * per level in both width and height, capped by the grid dimensions.
- */
-function computeUnlockedBounds(cols, rows, level) {
-  if (!cols || !rows) return null;
-  const size = Math.max(
-    1,
-    Math.min(
-      Math.min(cols, rows),
-      BASE_UNLOCK_SIZE + Math.max(0, level | 0)
-    )
-  );
-
-  const cx = Math.floor(cols / 2);
-  const cy = Math.floor(rows / 2);
-  const halfW = Math.floor(size / 2);
-  const halfH = Math.floor(size / 2);
-
-  let minX = cx - halfW;
-  let maxX = minX + size - 1;
-  let minY = cy - halfH;
-  let maxY = minY + size - 1;
-
-  // Clamp to board
-  if (minX < 0) {
-    maxX -= minX;
-    minX = 0;
-  }
-  if (maxX >= cols) {
-    const diff = maxX - cols + 1;
-    minX = Math.max(0, minX - diff);
-    maxX = cols - 1;
-  }
-  if (minY < 0) {
-    maxY -= minY;
-    minY = 0;
-  }
-  if (maxY >= rows) {
-    const diff = maxY - rows + 1;
-    minY = Math.max(0, minY - diff);
-    maxY = rows - 1;
-  }
-
-  return {
-    minX,
-    maxX,
-    minY,
-    maxY,
-    width: maxX - minX + 1,
-    height: maxY - minY + 1,
-  };
+function normalizeId(id) {
+  if (!id) return "";
+  const str = String(id).toLowerCase();
+  if (str === "r") return "road";
+  if (str === "av") return "avenue";
+  if (str === "rb" || str === "round" || str === "ra") return "roundabout";
+  if (str === "st" || str === "start") return "home";
+  return str;
 }
 
-const CELL = 32;
+function gridToTiles(grid) {
+  const out = [];
+  if (!Array.isArray(grid)) return out;
+  for (let y = 0; y < grid.length; y++) {
+    const row = grid[y];
+    if (!row) continue;
+    for (let x = 0; x < row.length; x++) {
+      const id = row[x];
+      if (id) {
+        out.push({ x, y, id: normalizeId(id), rot: 0 });
+      }
+    }
+  }
+  return out;
+}
 
-/* ---------- component ---------- */
+function toMap(tiles) {
+  const m = new Map();
+  (tiles || []).forEach((t) => {
+    if (Number.isFinite(t.x) && Number.isFinite(t.y) && t.id) {
+      m.set(`${t.x},${t.y}`, {
+        x: t.x,
+        y: t.y,
+        id: normalizeId(t.id),
+        rot: t.rot || 0,
+      });
+    }
+  });
+  return m;
+}
+
+/* ==================== COMPONENT ==================== */
+
 export default function CityBuilder({ dark = true }) {
   const wrapRef = useRef(null);
   const gridRef = useRef(null);
   const ghostRef = useRef(null);
 
-  /* ---------- slot management ---------- */
-  const [slots, setSlots] = useState(listSlots());
-  const [activeSlot, setActive] = useState(getActiveSlot());
-  const [gridData, setGridData] = useState(() => loadSim(getActiveSlot()));
+  const hydratedRef = useRef(false);
+  const loadingSlotRef = useRef(false);
 
-  // grid unlock level (Store will bump this via localStorage + event)
-  const [gridLevel, setGridLevel] = useState(() => getGridLevelFromStorage());
+  const [manager] = useState(
+    () =>
+      new BuilderManager({
+        buildInventory,
+        wallet: walletModule,
+        citySlots,
+      })
+  );
 
-  // small toast
+  if (typeof window !== "undefined") {
+    window.__pmBuilder = manager;
+  }
+
+  console.debug("[CityBuilder] manager-constructed", manager.getSystems());
+
+  const { grid, inventory, placement, slot, ui } = manager.getSystems();
+
+  /* ---------- React state ---------- */
+
+  const [slots, setSlots] = useState(() => slot.getSlots() || []);
+  const [activeSlot, setActiveSlot] = useState(
+    () => slot.activeSlot || slots[0]?.id || "default"
+  );
+
+  const [gridLevel, setGridLevel] = useState(grid.gridLevel || 0);
+  const [placedMap, setPlacedMap] = useState(new Map());
+  const [usage, setUsage] = useState({
+    perTile: {},
+    owned: {},
+    used: {},
+    available: {},
+  });
+
   const [toast, setToast] = useState("");
+  const [activeCategory, setActiveCategory] = useState("infrastructure");
+  const [select, setSelect] = useState("erase");
+  const [rot, setRot] = useState(0);
+  const [dragMode, setDragMode] = useState(null);
+  const [showUnlock, setShowUnlock] = useState(false);
+
+  const cellSize = CELL;
+  const cols = grid.cols || 6;
+  const rows = grid.rows || 6;
+
+  const categories = ui.getCategories();
+  const wallet = getWallet();
+
+  /* ---------- Toast helper ---------- */
+
   function say(m, ms = 1600) {
     setToast(String(m));
     clearTimeout(say._t);
     say._t = setTimeout(() => setToast(""), ms);
   }
 
-  // persist current slot’s inventory snapshot into sim.meta.inv
-  function persistInvToSlot(slotId) {
-    if (!slotId) return;
-    const sim = loadSim(slotId);
-    const inv = getInventory();
-    const merged = {
-      ...sim,
-      meta: { ...(sim.meta || {}), inv, updatedAt: Date.now() },
-    };
-    saveSim(merged, slotId);
-  }
-  // load inventory snapshot from sim.meta.inv or seed with starter for new slots
-  function loadInvFromSlot(slotId) {
-    const sim = loadSim(slotId);
-    const inv = sim?.meta?.inv;
-    setInventory(
-      inv && typeof inv === "object" ? inv : getStarterInventory()
-    );
-  }
+  /* ---------- Engine sync helpers ---------- */
+
+  const syncFromSystems = () => {
+    setGridLevel(grid.gridLevel);
+
+    const c = grid.cols || 6;
+    const r = grid.rows || 6;
+
+    const gridArr = placement.toGrid(c, r);
+    const tiles = gridToTiles(gridArr);
+    setPlacedMap(toMap(tiles));
+
+    const snapshot = manager.recomputeUsage();
+    if (snapshot) setUsage(snapshot);
+
+    console.debug("[CityBuilder] syncFromSystems", {
+      gridLevel: grid.gridLevel,
+      cols: c,
+      rows: r,
+      tileCount: tiles.length,
+    });
+  };
+
+  /* ---------- Initial mount / cleanup ---------- */
 
   useEffect(() => {
-    const reload = (e) => {
-      // Slot-cap hit event from citySlots -> show a toast and bail.
-      if (e && e.key === "pm_layout_slot_cap_hit_v1") {
-        try {
-          const payload = JSON.parse(e.newValue || "{}");
-          const cap = payload.cap;
-          say(
-            cap
-              ? `City slot limit reached (${cap} layouts).`
-              : "City slot limit reached."
-          );
-        } catch {
-          say("City slot limit reached.");
-        }
-        return;
-      }
+    console.debug("[CityBuilder] mount/useEffect(manager)");
 
-      setSlots(listSlots());
-      const cur = getActiveSlot();
-      setActive(cur);
-      setGridData(loadSim(cur));
-      loadInvFromSlot(cur); // keep toolbar in sync if another tab changed
-      setGridLevel(getGridLevelFromStorage());
+    setSlots(slot.getSlots() || []);
+    setActiveSlot(slot.activeSlot || slot.getSlots()?.[0]?.id || "default");
+
+    return () => {
+      console.debug("[CityBuilder] unmount – destroying manager");
+      manager.destroy();
     };
-    window.addEventListener("storage", reload);
-    return () => window.removeEventListener("storage", reload);
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [manager]);
 
-  // listen for explicit Store-level grid changes
+  /* ---------- Bootstrap builder from saved slot layout ---------- */
+
   useEffect(() => {
-    const sync = () => setGridLevel(getGridLevelFromStorage());
-    window.addEventListener("pm_build_grid_changed", sync);
-    return () => window.removeEventListener("pm_build_grid_changed", sync);
-  }, []);
-
-  function handleSlotChange(id) {
-    // save out current grid + inventory to the old slot
-    persistInvToSlot(activeSlot);
-    setActiveSlot(id);
-    setActive(id);
-
-    const sim = loadSim(id);
-    setGridData(sim);
-    loadInvFromSlot(id);
-
-    // refresh placed tiles for the new slot
-    const nextPlaced = shouldIgnoreSeed(sim?.grid)
-      ? new Map()
-      : toMap(gridToTiles(sim?.grid));
-    setPlacedMap(nextPlaced);
-    setInv(mapInv(getInventory()));
-  }
-
-  function handleNewSlot() {
-    const name = prompt("New slot ID:");
-    if (!name) return;
-
-    const ok = createSlot(name);
-    if (!ok) {
-      // If we hit the cap, the storage listener already showed a toast.
-      // This guard just stops us from switching into a non-existent slot.
-      say("Unable to create new city slot (name in use or limit reached).");
+    if (!activeSlot) {
+      console.debug("[CityBuilder] bootstrap: no activeSlot");
       return;
     }
 
-    // fresh slot starts with starter inventory
-    setInventory(getStarterInventory());
-    setActiveSlot(name);
-    setActive(name);
-    const sim = loadSim(name);
-    setGridData(sim);
-    const nextPlaced = shouldIgnoreSeed(sim?.grid)
-      ? new Map()
-      : toMap(gridToTiles(sim?.grid));
-    setPlacedMap(nextPlaced);
-    setInv(mapInv(getInventory()));
-  }
+    loadingSlotRef.current = true;
+    hydratedRef.current = false;
 
-  function handleDeleteSlot() {
-    if (confirm(`Delete slot '${activeSlot}'?`)) {
-      persistInvToSlot(activeSlot);
-      deleteSlot(activeSlot);
-      const cur = getActiveSlot();
-      setActive(cur);
-      const sim = loadSim(cur);
-      setGridData(sim);
-      loadInvFromSlot(cur);
-      setPlacedMap(
-        shouldIgnoreSeed(sim?.grid)
-          ? new Map()
-          : toMap(gridToTiles(sim?.grid))
-      );
-      setInv(mapInv(getInventory()));
-    }
-  }
+    try {
+      console.debug("[CityBuilder] bootstrap: loading sim for", activeSlot);
+      const sim = citySlots.loadSim(activeSlot) || {};
+      const simGrid = Array.isArray(sim.grid) ? sim.grid : [];
 
-  function handleRenameSlot() {
-    const name = prompt("Rename slot:", activeSlot);
-    if (!name) return;
-    renameSlot(activeSlot, name);
-    setSlots(listSlots());
-  }
+      console.debug("[CityBuilder] bootstrap: sim snapshot", {
+        slotId: activeSlot,
+        w: sim.w,
+        h: sim.h,
+        rows: simGrid.length,
+      });
 
-  /* ---------- grid / map ---------- */
-  const defaultCols = Math.max(
-    6,
-    gridData?.grid?.[0]?.length || gridData?.w || 32
-  );
-  const defaultRows = Math.max(
-    6,
-    gridData?.grid?.length || gridData?.h || 18
-  );
-  const seedLooksEmpty = shouldIgnoreSeed(gridData?.grid);
+      // CRITICAL FIX: Use PlacementSystem.loadGrid directly
+      // This loads tiles WITHOUT charging mate coins
+      if (simGrid.length > 0) {
+        placement.loadGrid(simGrid, sim.w || 6, sim.h || 6);
+      } else {
+        placement.clearAll();
+      }
 
-  const [cols] = useState(defaultCols);
-  const [rows] = useState(defaultRows);
+      console.debug("[CityBuilder] bootstrap: tiles loaded via placement.loadGrid");
 
-  const initialPlaced = seedLooksEmpty
-    ? new Map()
-    : toMap(gridToTiles(gridData?.grid));
-  const [placedMap, setPlacedMap] = useState(initialPlaced);
+      // Now sync to React state
+      syncFromSystems();
 
-  useEffect(() => {
-    if (seedLooksEmpty) {
-      saveSim(
-        { w: cols, h: rows, grid: tilesToGrid([], cols, rows) },
-        activeSlot
-      );
+      // Mark as hydrated
+      Promise.resolve().then(() => {
+        hydratedRef.current = true;
+        loadingSlotRef.current = false;
+        console.debug("[CityBuilder] bootstrap: hydration complete", {
+          activeSlot,
+          hydratedRef: hydratedRef.current,
+        });
+      });
+    } catch (err) {
+      console.warn("[CityBuilder] Failed to bootstrap from slot", err);
+      loadingSlotRef.current = false;
+      hydratedRef.current = true;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // once
+  }, [activeSlot]);
 
-  const [zoom] = useState(1);
-  const [select, setSelect] = useState("erase");
-  const [rot, setRot] = useState(0);
-  const [dragMode, setDragMode] = useState(null);
-  const [inv, setInv] = useState(() => mapInv(getInventory()));
-  const cellSize = CELL * zoom;
+  /* ---------- Category → UI ---------- */
 
-  const tiles = useMemo(() => {
-    const ids = new Set(TILESET.map((t) => t.id));
-    Object.keys(inv || {}).forEach((id) => ids.add(normalizeId(id)));
-    ids.delete("start");
-    return ["erase", ...Array.from(ids)];
-  }, [inv]);
+  const getTileView = (rawId) => {
+    const id = normalizeId(rawId);
+    const staticInfo = ui.getTileInfo(id);
 
-  // unlocked region for current grid + level
-  const unlockedBounds = useMemo(
-    () => computeUnlockedBounds(cols, rows, gridLevel),
-    [cols, rows, gridLevel]
-  );
+    let info = null;
+    if (typeof inventory.getTileInfo === "function") {
+      info = inventory.getTileInfo(id);
+    }
 
-  const isCellUnlocked = (x, y) => {
-    if (!unlockedBounds) return true;
-    const { minX, maxX, minY, maxY } = unlockedBounds;
-    return x >= minX && x <= maxX && y >= minY && y <= maxY;
+    const owned = info?.count ?? 0;
+    const available =
+      usage.available && Object.prototype.hasOwnProperty.call(usage.available, id)
+        ? usage.available[id]
+        : owned;
+    const used =
+      usage.used && Object.prototype.hasOwnProperty.call(usage.used, id)
+        ? usage.used[id]
+        : Math.max(0, owned - available);
+
+    return {
+      id,
+      name: staticInfo.name,
+      icon: staticInfo.icon,
+      color: staticInfo.color,
+      owned,
+      available,
+      used,
+      mateCost: info?.mateCost ?? 0,
+      unlockCost: info?.unlockCost ?? 0,
+      unlocked: info?.unlocked ?? true,
+    };
   };
 
-  const lockedCells = useMemo(() => {
-    if (!unlockedBounds) return [];
-    const { minX, maxX, minY, maxY } = unlockedBounds;
+  const activeCategoryTiles = useMemo(() => {
+    const category = categories[activeCategory];
+    if (!category) return [];
+    return (category.tiles || [])
+      .map(getTileView)
+      .filter(
+        (t) =>
+          t.owned > 0 ||
+          t.available > 0 ||
+          t.mateCost > 0 ||
+          t.unlockCost > 0
+      );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeCategory, categories, usage]);
+
+  const lockedTiles = useMemo(() => {
     const out = [];
-    for (let y = 0; y < rows; y++) {
-      for (let x = 0; x < cols; x++) {
-        if (x < minX || x > maxX || y < minY || y > maxY) {
-          out.push({ x, y });
+    for (const [catId, cat] of Object.entries(categories)) {
+      for (const id of cat.tiles || []) {
+        const tv = getTileView(id);
+        if (!tv.unlocked && tv.unlockCost > 0) {
+          out.push({
+            ...tv,
+            categoryId: catId,
+            categoryName: cat.name,
+          });
         }
       }
     }
     return out;
-  }, [rows, cols, unlockedBounds]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [categories, usage]);
 
-  /* ---------- persist to active slot on edits ---------- */
-  useEffect(() => {
-    const tilesArr = Array.from(placedMap.values());
-    const w = cols,
-      h = rows;
-    const grid = tilesToGrid(tilesArr, w, h);
-    // also persist the slot’s own inventory snapshot each time we change the board
-    const sim = loadSim(activeSlot);
-    saveSim(
-      {
-        ...sim,
-        w,
-        h,
-        grid,
-        meta: {
-          ...(sim.meta || {}),
-          inv: getInventory(),
-          updatedAt: Date.now(),
-        },
-      },
-      activeSlot
+  const tiles = useMemo(() => {
+    const ids = new Set();
+    for (const cat of Object.values(categories)) {
+      for (const id of cat.tiles || []) {
+        const tv = getTileView(id);
+        if (!tv.unlocked) continue;
+        if (tv.owned > 0 || tv.available > 0 || tv.mateCost > 0) {
+          ids.add(tv.id);
+        }
+      }
+    }
+    ids.delete("start");
+    return ["erase", ...Array.from(ids)];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [categories, usage]);
+
+  /* ---------- Grid / unlock helpers ---------- */
+
+  const unlockedBounds = grid.unlockedBounds;
+  const isCellUnlocked = (x, y) => grid.isCellUnlocked(x, y);
+  const lockedCells = grid.getLockedCells();
+
+  function hasAdjacentRoad(gx, gy, map) {
+    const check = (x, y) => {
+      const tile = map.get(`${x},${y}`);
+      return tile && ROADLIKE.has(tile.id);
+    };
+    return (
+      check(gx - 1, gy) ||
+      check(gx + 1, gy) ||
+      check(gx, gy - 1) ||
+      check(gx, gy + 1)
     );
-  }, [placedMap, cols, rows, activeSlot]);
+  }
 
-  /* ---------- pointer & ghost ---------- */
+  const handleUnlockGrid = () => {
+    const cost = grid.getNextUnlockCost();
+    const bal = wallet.coins;
+    if (bal < cost) {
+      say(`Not enough coins. Need ${cost}, have ${bal}`);
+      return;
+    }
+    const res = manager.unlockNextGridLevel();
+    if (res.success) {
+      say(`Grid unlocked! ${res.newSize.w}×${res.newSize.h}`);
+      syncFromSystems();
+    } else {
+      say(res.reason || "Failed to unlock grid");
+    }
+  };
+
+  const handleUnlockTile = (id) => {
+    const cost = inventory.getUnlockCost?.(id) ?? 0;
+    const bal = wallet.coins;
+    if (bal < cost) {
+      say(`Not enough coins. Need ${cost}, have ${bal}`);
+      return;
+    }
+    const res = manager.unlockTile(id);
+    if (res.success) {
+      say(`Unlocked ${id}!`);
+      syncFromSystems();
+    } else {
+      say(res.reason || `Failed to unlock ${id}`);
+    }
+  };
+
+  const handleResetLayout = () => {
+    if (!window.confirm("Clear all tiles from this slot?")) return;
+    const c = grid.cols || 6;
+    const r = grid.rows || 6;
+    const current = placement.toGrid(c, r) || [];
+    for (let y = 0; y < current.length; y++) {
+      const row = current[y];
+      if (!row) continue;
+      for (let x = 0; x < row.length; x++) {
+        if (row[x]) manager.removeTile(x, y);
+      }
+    }
+    syncFromSystems();
+    say("Layout cleared!");
+  };
+
+  /* ---------- Persist layout → citySlots (for CityScene) ---------- */
+
+  useEffect(() => {
+    if (!activeSlot) return;
+    if (!cols || !rows) return;
+
+    if (!hydratedRef.current || loadingSlotRef.current) {
+      console.debug("[CityBuilder] persist: skipped (not hydrated yet)", {
+        activeSlot,
+        hydrated: hydratedRef.current,
+        loading: loadingSlotRef.current,
+      });
+      return;
+    }
+
+    const gridArr = Array.from({ length: rows }, () =>
+      Array.from({ length: cols }, () => "")
+    );
+
+    for (const t of placedMap.values()) {
+      if (
+        Number.isFinite(t.x) &&
+        Number.isFinite(t.y) &&
+        t.x >= 0 &&
+        t.x < cols &&
+        t.y >= 0 &&
+        t.y < rows
+      ) {
+        gridArr[t.y][t.x] = normalizeId(t.id);
+      }
+    }
+
+    const sim = citySlots.loadSim(activeSlot) || {};
+    const merged = {
+      ...sim,
+      w: cols,
+      h: rows,
+      grid: gridArr,
+      meta: {
+        ...(sim.meta || {}),
+        updatedAt: Date.now(),
+      },
+    };
+
+    console.debug("[CityBuilder] persist: saving layout", {
+      activeSlot,
+      tileCount: placedMap.size,
+      w: merged.w,
+      h: merged.h,
+    });
+
+    citySlots.saveSim(merged, activeSlot);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [placedMap, activeSlot, cols, rows]);
+
+  /* ---------- Placement / erase (ENGINE-FIRST) ---------- */
+
+  const applyAt = (gx, gy) => {
+    if (!Number.isFinite(gx) || !Number.isFinite(gy)) return;
+    if (gx < 0 || gx >= cols || gy < 0 || gy >= rows) return;
+
+    const key = `${gx},${gy}`;
+    const existing = placedMap.get(key);
+
+    // Erase mode
+    if (select === "erase") {
+      if (!existing) return;
+      const res = manager.removeTile(gx, gy);
+      if (res && res.success) {
+        syncFromSystems();
+      }
+      return;
+    }
+
+    // Locked area check
+    if (!isCellUnlocked(gx, gy)) {
+      say("Locked area – expand your lot in the Store");
+      return;
+    }
+
+    if (!select || select === "erase") return;
+
+    const normId = normalizeId(select);
+
+    // Building adjacency rule
+    if (BUILDINGS.has(normId)) {
+      if (!hasAdjacentRoad(gx, gy, placedMap)) {
+        say("Must connect to a road");
+        return;
+      }
+    }
+
+    // Place tile (this now handles mate coin charging)
+    const res = manager.placeTile(gx, gy, normId, rot);
+    
+    if (!res || !res.success) {
+      if (res?.reason === "insufficient_funds") {
+        say(`Need ${res.cost} more coins`);
+      } else if (res?.reason === "max_owned_reached") {
+        say("Max reached for this tile");
+      } else if (res?.reason === "not_unlocked") {
+        say("Unlock this building first");
+      } else if (res?.reason === "locked_area") {
+        say("Locked area");
+      } else if (res?.reason === "needs_road") {
+        say("Must connect to a road");
+      } else {
+        say(res?.reason || "Cannot place here");
+      }
+      return;
+    }
+
+    syncFromSystems();
+  };
+
+  /* ---------- Ghost cursor ---------- */
+
   useEffect(() => {
     const el = gridRef.current;
     if (!el) return;
+
     const onMove = (e) => {
       const p = e.touches ? e.touches[0] : e;
       const rect = el.getBoundingClientRect();
@@ -404,520 +511,328 @@ export default function CityBuilder({ dark = true }) {
         0,
         rows - 1
       );
+
       const ghost = ghostRef.current;
       if (!ghost) return;
-      ghost.style.transform = `translate(${gx * cellSize}px, ${
-        gy * cellSize
-      }px) rotate(${rot}deg)`;
-      ghost.style.width = `${cellSize}px`;
-      ghost.style.height = `${cellSize}px`;
-      ghost.style.opacity = 1;
-      ghost.dataset.gx = gx;
-      ghost.dataset.gy = gy;
+      ghost.style.left = gx * cellSize + "px";
+      ghost.style.top = gy * cellSize + "px";
+      ghost.style.width = cellSize + "px";
+      ghost.style.height = cellSize + "px";
+      ghost.style.opacity = isCellUnlocked(gx, gy) ? "0.7" : "0.3";
 
-      const normSel = normalizeId(select || "");
-      const invCount = inv[normSel] ?? 0;
-      const haveInv = normSel && invCount > 0;
-      const cost = normSel ? placementCostMate(normSel) : 0;
-      const placeable = select === "erase" || haveInv || cost > 0;
-
-      ghost.style.borderColor = placeable
-        ? dark
-          ? "#86efac"
-          : "#10b981"
-        : dark
-        ? "#f87171"
-        : "#dc2626";
-
-      if (dragMode)
-        applyAt(
-          gx,
-          gy,
-          dragMode
-        );
+      // Apply placement on drag
+      if (dragMode) {
+        applyAt(gx, gy);
+      }
     };
-    const onLeave = () =>
-      ghostRef.current && (ghostRef.current.style.opacity = 0);
+
+    const onEnter = () => {
+      if (ghostRef.current) ghostRef.current.style.opacity = "0.7";
+    };
+    const onLeave = () => {
+      if (ghostRef.current) ghostRef.current.style.opacity = "0";
+    };
+
     el.addEventListener("mousemove", onMove);
+    el.addEventListener("touchmove", onMove);
+    el.addEventListener("mouseenter", onEnter);
     el.addEventListener("mouseleave", onLeave);
+
     return () => {
       el.removeEventListener("mousemove", onMove);
+      el.removeEventListener("touchmove", onMove);
+      el.addEventListener("mouseenter", onEnter);
       el.removeEventListener("mouseleave", onLeave);
     };
-  }, [rows, cols, rot, dragMode, select, inv, cellSize, dark]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cols, rows, cellSize, dragMode, select, rot]);
 
-  /* ---------- keyboard hotkeys ---------- */
-  useEffect(() => {
-    const onKey = (e) => {
-      if (e.key === "r" || e.key === "R") {
-        setRot((v) => (v + 90) % 360);
-        e.preventDefault();
-        return;
-      }
-      if (e.key === "Escape" || e.key === "Backspace") {
-        setSelect("erase");
-        e.preventDefault();
-        return;
-      }
-      const num = "0123456789".indexOf(e.key);
-      if (num >= 0) {
-        const id = tiles[num] || tiles[tiles.length - 1];
-        if (id && id !== "erase") setSelect(normalizeId(id));
-        else setSelect("erase");
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [tiles]);
-
-  /* ---------- helpers for rules ---------- */
-  const keyOf = (x, y) => `${x},${y}`;
-  const isRoadLike = (id) => ROADLIKE.has(normalizeId(id));
-  const hasAdjacentRoad = (x, y, map = placedMap) => {
-    const n = map.get(keyOf(x, y - 1));
-    const s = map.get(keyOf(x, y + 1));
-    const w = map.get(keyOf(x - 1, y));
-    const e = map.get(keyOf(x + 1, y));
-    return !![n, s, w, e].find((t) => t && isRoadLike(t.id));
-  };
-  const placementCostMate = (id) => COST_MATE[normalizeId(id)] || 0;
-
-  /* ---------- place / erase (inventory first, then Mate) ---------- */
-  const applyAt = (gx, gy, mode) => {
-    const key = `${gx},${gy}`;
-    const existing = placedMap.get(key);
-
-    // erase
-    if (mode === "erase" || select === "erase") {
-      if (existing) {
-        placedMap.delete(key);
-        setPlacedMap(new Map(placedMap));
-        addItem(normalizeId(existing.id), 1); // refund tile (never Mate)
-        setInv(mapInv(getInventory()));
-      }
-      return;
-    }
-
-    if (!select) return;
-
-    // grid lock: cannot place outside unlocked area
-    if (!isCellUnlocked(gx, gy)) {
-      say("Locked area – expand your lot in the Store");
-      return;
-    }
-
-    const normId = normalizeId(select);
-    const invCount = inv[normId] ?? 0;
-    const haveInv = invCount > 0;
-    const cost = placementCostMate(normId);
-
-    // If there is no inventory and no Mate-cost path, you're just out of stock.
-    if (!haveInv && cost <= 0) {
-      say("Out of stock");
-      return;
-    }
-
-    // Building adjacency rule (applies for both free and Mate-paid placements)
-    if (BUILDINGS.has(normId)) {
-      if (!hasAdjacentRoad(gx, gy, placedMap)) {
-        say("Must connect to a road");
-        return;
-      }
-    }
-
-    // Inventory exhausted but this tile has a Mate cost: charge Mate.
-    if (!haveInv && cost > 0) {
-      const spent = spendMate(cost, {
-        k: "build_place",
-        tile: normId,
-      });
-      if (!spent?.ok) {
-        const have = getWallet().coins || 0;
-        say(`Need ${cost} Mate (have ${have})`);
-        return;
-      }
-    }
-
-    // Swap-in placement: refund previous tile to inventory (no Mate refund).
-    if (existing) addItem(normalizeId(existing.id), 1);
-
-    const next = { x: gx, y: gy, id: normId, rot };
-    placedMap.set(key, next);
-    setPlacedMap(new Map(placedMap));
-
-    // Only consume inventory if we actually used inventory for this placement.
-    if (haveInv) {
-      consume(normId, 1);
-    }
-
-    const ni = mapInv(getInventory());
-    setInv(ni);
-
-    // If this is a purely inventory-limited tile (no Mate path) and we're out, auto-erase.
-    if (!cost && (ni[normId] ?? 0) <= 0) {
-      setSelect("erase");
-    }
-  };
+  /* ---------- Mouse / Touch Interaction ---------- */
 
   const onMouseDown = (e) => {
     if (e.button === 2) {
       setDragMode("erase");
-      if (ghostRef.current)
-        applyAt(
-          +ghostRef.current.dataset.gx,
-          +ghostRef.current.dataset.gy,
-          "erase"
-        );
-    } else if (e.button === 0) {
-      setDragMode(select === "erase" ? "erase" : "place");
-      if (ghostRef.current) {
-        applyAt(
-          +ghostRef.current.dataset.gx,
-          +ghostRef.current.dataset.gy,
-          select === "erase" ? "erase" : "place"
-        );
-      }
+      return;
     }
+    if (e.button !== 0) return;
+    setDragMode("place");
   };
-  const onMouseUp = () => setDragMode(null);
 
-  /* ---------- RANDOM builder (respects locked area) ---------- */
-  function randomFromInventory() {
-    const w = cols,
-      h = rows;
-    const bank = mapInv(getInventory());
-    for (const t of placedMap.values()) {
-      const id = normalizeId(t.id);
-      bank[id] = (bank[id] ?? 0) + 1;
-    }
-    if (bank.r) {
-      bank.road = (bank.road ?? 0) + bank.r;
-      delete bank.r;
-    }
-    if (bank.av) {
-      bank.avenue = (bank.avenue ?? 0) + bank.av;
-      delete bank.av;
-    }
-    if (bank.st) {
-      bank.home = (bank.home ?? 0) + bank.st;
-      delete bank.st;
-    }
-    if (bank.rb) {
-      bank.roundabout = (bank.roundabout ?? 0) + bank.rb;
-      delete bank.rb;
-    }
+  const onMouseUp = () => {
+    setDragMode(null);
+  };
 
-    reconcileInventoryTo(bank);
-    const fresh = new Map();
-    setPlacedMap(fresh);
-    saveSim(
-      { w, h, grid: tilesToGrid([], w, h) },
-      activeSlot
-    );
+  // CRITICAL FIX: Handle single clicks
+  const onClick = (e) => {
+    const rect = gridRef.current?.getBoundingClientRect();
+    if (!rect) return;
 
-    const spend = (id, n = 1) => {
-      id = normalizeId(id);
-      if ((bank[id] ?? 0) < n) return false;
-      bank[id] -= n;
-      return true;
+    const p = e.touches ? e.touches[0] : e;
+    const gx = Math.floor((p.clientX - rect.left) / cellSize);
+    const gy = Math.floor((p.clientY - rect.top) / cellSize);
+
+    applyAt(gx, gy);
+  };
+
+  /* ---------- Keyboard ---------- */
+
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === "r" || e.key === "R") {
+        e.preventDefault();
+        setRot((v) => (v + 90) % 360);
+      }
+      if (e.key === "e" || e.key === "E") {
+        e.preventDefault();
+        setSelect("erase");
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setSelect("erase");
+        setRot(0);
+      }
     };
-    const put = (x, y, id) => {
-      id = normalizeId(id);
-      if (!isCellUnlocked(x, y)) return;
-      const k = `${x},${y}`;
-      const prev = fresh.get(k);
-      if (prev) bank[prev.id] = (bank[prev.id] ?? 0) + 1;
-      fresh.set(k, { x, y, id, rot: 0 });
-    };
-    const empty = (x, y) => !fresh.has(`${x},${y}`);
-    const inBounds = (x, y) =>
-      x >= 1 &&
-      x < w - 1 &&
-      y >= 1 &&
-      y < h - 1 &&
-      isCellUnlocked(x, y);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
-    let roads = bank.road ?? 0;
-    let cx = Math.floor(w * 0.5),
-      cy = Math.floor(h * 0.55);
-    if (roads > 0) {
-      const left = Math.max(1, Math.floor(w * 0.18));
-      const right = Math.min(
-        w - 2,
-        Math.floor(w * 0.82)
-      );
-      for (let x = left; x <= right && roads > 0; x++) {
-        if (!isCellUnlocked(x, cy)) continue;
-        if (spend("road")) {
-          put(x, cy, "road");
-          roads--;
-        }
-      }
-      cx = Math.floor((left + right) / 2);
-      for (
-        let yy = cy - 3;
-        yy >= Math.max(2, cy - 6) && roads > 0;
-        yy--
-      ) {
-        if (!isCellUnlocked(cx, yy)) continue;
-        if (empty(cx, yy) && spend("road")) {
-          put(cx, yy, "road");
-          roads--;
-        }
-      }
-      for (let x = left + 4; x < right - 2 && roads > 0; x += 6) {
-        const len = Math.min(3, roads);
-        const dir = Math.random() < 0.5 ? -1 : 1;
-        for (let i = 0; i < len && roads > 0; i++) {
-          const yy = cy + dir * (i + 1);
-          if (!inBounds(x, yy)) break;
-          if (empty(x, yy) && spend("road")) {
-            put(x, yy, "road");
-            roads--;
-          }
-        }
-      }
-    }
-    if ((bank.home ?? 0) > 0) {
-      const adj = [
-        [cx, cy - 1],
-        [cx, cy + 1],
-        [cx - 1, cy],
-        [cx + 1, cy],
-      ].filter(
-        ([x, y]) => inBounds(x, y) && empty(x, y)
-      );
-      if (adj.length && spend("home")) {
-        const [hx, hy] = adj[(Math.random() * adj.length) | 0];
-        put(hx, hy, "home");
-      }
-    }
-    let rbs = bank.roundabout ?? 0;
-    if (rbs > 0) {
-      const isRoad = (x, y) => {
-        const id = fresh.get(`${x},${y}`)?.id;
-        return id === "road" || id === "avenue";
-      };
-      for (const { x, y, id } of Array.from(
-        fresh.values()
-      )) {
-        if (!rbs) break;
-        if (!(id === "road" || id === "avenue")) continue;
-        const n =
-          (isRoad(x, y - 1) ? 1 : 0) +
-          (isRoad(x, y + 1) ? 1 : 0) +
-          (isRoad(x - 1, y) ? 1 : 0) +
-          (isRoad(x + 1, y) ? 1 : 0);
-        if (
-          n >= 3 &&
-          isCellUnlocked(x, y) &&
-          spend("roundabout")
-        ) {
-          put(x, y, "roundabout");
-          rbs--;
-        }
-      }
-    }
-    const poiSlots = [
-      { id: "park",  limit: bank.park  ?? 0 },
-      { id: "shop",  limit: bank.shop  ?? 0 },
-      { id: "hq",    limit: bank.hq    ?? 0 },
-      { id: "house", limit: bank.house ?? 0 },
-    ];
-    const roadCoords = Array.from(fresh.values())
-      .filter(
-        (t) =>
-          t.id === "road" ||
-          t.id === "avenue" ||
-          t.id === "roundabout"
-      )
-      .map((t) => [t.x, t.y]);
-    const near = (x, y) =>
-      roadCoords.some(
-        ([rx, ry]) =>
-          Math.abs(rx - x) + Math.abs(ry - y) === 1
-      );
+  /* ---------- Render: auto-roundabout logic ---------- */
 
-    for (const { id, limit } of poiSlots) {
-      let placed = 0,
-        attempts = 0;
-      while (placed < limit && attempts < 500) {
-        attempts++;
-        const x =
-          1 + ((Math.random() * (w - 2)) | 0);
-        const y =
-          1 + ((Math.random() * (h - 2)) | 0);
-        if (
-          inBounds(x, y) &&
-          empty(x, y) &&
-          near(x, y) &&
-          spend(id)
-        ) {
-          put(x, y, id);
-          placed++;
-        }
-      }
-    }
-
-    setPlacedMap(new Map(fresh));
-    saveSim(
-      { w, h, grid: tilesToGrid(Array.from(fresh.values()), w, h) },
-      activeSlot
-    );
-    reconcileInventoryTo(bank);
-    setInv(mapInv(getInventory()));
-    if (
-      select !== "erase" &&
-      (getInventory()[select] ?? 0) <= 0
-    )
-      setSelect("erase");
-  }
-
-  function reconcileInventoryTo(targetBank) {
-    const cur = mapInv(getInventory());
-    const keys = new Set([
-      ...Object.keys(cur),
-      ...Object.keys(targetBank),
-    ]);
-    for (const k of keys) {
-      const want = targetBank[k] ?? 0;
-      const have = cur[k] ?? 0;
-      if (want > have) addItem(k, want - have);
-      else if (have > want) consume(k, have - want);
-    }
-  }
-
-  /* ---------- UI ---------- */
-  const placed = Array.from(placedMap.values());
-  const autoRoundaboutKeys = useMemo(() => {
-    const drivable = new Set(
-      placed
-        .filter(
-          (t) =>
-            t.id === "road" ||
-            t.id === "avenue" ||
-            t.id === "roundabout"
-        )
-        .map((t) => `${t.x},${t.y}`)
-    );
-    const res = new Set();
-    for (const t of placed) {
-      if (!(t.id === "road" || t.id === "avenue")) continue;
-      const n =
-        (drivable.has(`${t.x},${t.y - 1}`) ? 1 : 0) +
-        (drivable.has(`${t.x},${t.y + 1}`) ? 1 : 0) +
-        (drivable.has(`${t.x - 1},${t.y}`) ? 1 : 0) +
-        (drivable.has(`${t.x + 1},${t.y}`) ? 1 : 0);
-      if (n >= 3) res.add(`${t.x},${t.y}`);
-    }
-    return res;
+  const placed = useMemo(() => {
+    return Array.from(placedMap.values());
   }, [placedMap]);
 
-  const wallet = getWallet();
+  const autoRoundaboutKeys = useMemo(() => {
+    const out = new Set();
+    const getAt = (x, y) => placedMap.get(`${x},${y}`)?.id || "";
+
+    for (const t of placed) {
+      if (!ROADLIKE.has(t.id)) continue;
+      const cx = t.x;
+      const cy = t.y;
+
+      const n = ROADLIKE.has(getAt(cx, cy - 1));
+      const s = ROADLIKE.has(getAt(cx, cy + 1));
+      const w = ROADLIKE.has(getAt(cx - 1, cy));
+      const e = ROADLIKE.has(getAt(cx + 1, cy));
+
+      const count = [n, s, w, e].filter(Boolean).length;
+      if (count >= 3 && t.id !== "roundabout") {
+        out.add(`${cx},${cy}`);
+      }
+    }
+    return out;
+  }, [placed, placedMap]);
+
+  /* ---------- UI ---------- */
+
+  const nextUnlockCost = grid.getNextUnlockCost ? grid.getNextUnlockCost() : 0;
+  const canUnlock = gridLevel < (grid.maxGridLevel ?? 3);
 
   return (
-    <div className="p-4 select-none">
-      {/* Slot controls */}
-      <div className="flex items-center gap-2 mb-4">
+    <div
+      className="p-4 max-w-3xl mx-auto"
+      style={{
+        fontFamily: "system-ui, sans-serif",
+        background: dark ? "#0a0a0a" : "#fefefe",
+        color: dark ? "#f9fafb" : "#111827",
+        minHeight: "100vh",
+      }}
+    >
+      {/* Header */}
+      <div className="mb-4 flex items-center justify-between">
+        <h1 className="text-xl font-bold">City Builder</h1>
+        <div className="flex items-center gap-2 text-sm">
+          <span>🪙 {wallet.coins.toLocaleString()}</span>
+          <span className="opacity-50">|</span>
+          <span>💵 {fmtUSD(wallet.usd)}</span>
+        </div>
+      </div>
+
+      {/* Slot selector */}
+      <div className="mb-3 flex items-center gap-2">
+        <span className="text-sm opacity-75">Slot:</span>
         <select
           value={activeSlot}
-          onChange={(e) => handleSlotChange(e.target.value)}
-          className="border rounded-md px-2 py-1 bg-gray-800 text-white"
+          onChange={(e) => {
+            const newSlot = e.target.value;
+            setActiveSlot(newSlot);
+            slot.setActive(newSlot);
+          }}
+          className="px-2 py-1 rounded border text-sm"
+          style={{
+            background: dark ? "#1f2937" : "#f9fafb",
+            color: dark ? "#f9fafb" : "#111827",
+            borderColor: dark ? "#374151" : "#d1d5db",
+          }}
         >
           {slots.map((s) => (
             <option key={s.id} value={s.id}>
-              {s.name || s.id}
+              {s.name}
             </option>
           ))}
         </select>
         <button
-          onClick={handleNewSlot}
-          className="px-2 py-1 border rounded-md"
+          onClick={handleResetLayout}
+          className="px-2 py-1 rounded border text-xs"
+          style={{
+            background: dark ? "#1f2937" : "#f9fafb",
+            borderColor: dark ? "#374151" : "#d1d5db",
+          }}
+          title="Clear all tiles"
         >
-          + New
+          Reset
         </button>
-        <button
-          onClick={handleRenameSlot}
-          className="px-2 py-1 border rounded-md"
-        >
-          Rename
-        </button>
-        <button
-          onClick={handleDeleteSlot}
-          className="px-2 py-1 border rounded-md"
-        >
-          Delete
-        </button>
-
-        <div className="ml-auto flex items-center gap-3">
-          <div className="text-sm opacity-80">
-            Mate:{" "}
-            <b className="tabular-nums">
-              {wallet.coins?.toLocaleString?.() ?? 0}
-            </b>{" "}
-            <span className="text-xs opacity-70">
-              ({fmtUSD(convertCoinsToUsd(wallet.coins || 0))})
-            </span>
-          </div>
-          <button
-            onClick={randomFromInventory}
-            className="px-3 py-1 rounded-lg border"
-            title="Refund board → randomize using only what you own"
-          >
-            🎲 Random
-          </button>
-          <div className="text-xs opacity-70 hidden sm:block">
-            Hotkeys: 0-9 select, R rotate, Esc erase, RMB erase-drag
-          </div>
-        </div>
       </div>
 
-      {/* Toolbar */}
-      <div className="flex flex-wrap items-center gap-2 mb-3">
-        {tiles.map((rawId, i) => {
-          const id = normalizeId(rawId);
-          const count = id === "erase" ? null : inv[id] ?? 0;
-          // If tile has Mate cost, it's never fully disabled: you can build with Mate after inv = 0
-          const disabled =
-            id !== "erase" && count <= 0 && placementCostMate(id) <= 0;
-          const selected = select === id;
-          const swatch =
-            id === "erase"
-              ? "#0000"
-              : PALETTE[id]?.color || colorFromId(id);
-          const mateCost = placementCostMate(id);
+      {/* Grid unlock */}
+      {canUnlock && (
+        <div className="mb-3 p-3 rounded-lg border flex items-center justify-between bg-blue-50/80 dark:bg-stone-900/80 border-blue-400/60 dark:border-stone-600">
+          <div>
+            <div className="font-semibold text-sm">
+              Unlock bigger city ({cols}×{rows} → {cols + 6}×{rows + 6})
+            </div>
+            <div className="text-xs opacity-70">
+              Cost: {nextUnlockCost.toLocaleString()} MateCoin
+            </div>
+          </div>
+          <button
+            onClick={handleUnlockGrid}
+            className="px-3 py-1.5 rounded-lg border text-sm font-medium"
+            style={{
+              background: dark ? "#1e40af" : "#3b82f6",
+              color: "#fff",
+              borderColor: dark ? "#1e3a8a" : "#2563eb",
+            }}
+          >
+            Unlock
+          </button>
+        </div>
+      )}
+
+      {/* Category tabs */}
+      <div className="mb-3 flex gap-2 overflow-x-auto pb-2">
+        {Object.keys(categories).map((cat) => {
+          const active = cat === activeCategory;
           return (
             <button
-              key={rawId}
-              onClick={() => !disabled && setSelect(id)}
-              disabled={disabled}
-              className="px-2 py-1 rounded-lg border flex items-center gap-2"
-              title={i < 10 ? `Hotkey: ${i}` : ""}
+              key={cat}
+              onClick={() => setActiveCategory(cat)}
+              className="px-3 py-1.5 rounded-lg border text-sm whitespace-nowrap"
               style={{
-                opacity: disabled ? 0.5 : 1,
-                background: selected
+                background: active
                   ? dark
-                    ? "#1f2937"
-                    : "#fde68a"
+                    ? "#374151"
+                    : "#e5e7eb"
                   : dark
-                  ? "#151515"
+                  ? "#1f2937"
+                  : "#f9fafb",
+                color: dark ? "#f9fafb" : "#111827",
+                borderColor: active
+                  ? dark
+                    ? "#4b5563"
+                    : "#d1d5db"
+                  : dark
+                  ? "#374151"
+                  : "#e5e7eb",
+              }}
+            >
+              {categories[cat].icon} {categories[cat].name}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Tile palette */}
+      <div className="mb-3 flex flex-wrap gap-2">
+        <button
+          onClick={() => setSelect("erase")}
+          className="px-3 py-2 rounded-lg border text-sm flex items-center gap-2"
+          style={{
+            background:
+              select === "erase"
+                ? dark
+                  ? "#7f1d1d"
+                  : "#fee2e2"
+                : dark
+                ? "#1f2937"
+                : "#f9fafb",
+            borderColor:
+              select === "erase"
+                ? dark
+                  ? "#991b1b"
+                  : "#fca5a5"
+                : dark
+                ? "#374151"
+                : "#e5e7eb",
+            color: dark ? "#fff" : "#111",
+          }}
+        >
+          🗑️ Erase
+        </button>
+
+        {activeCategoryTiles.map((tv) => {
+          const { id, name, icon, color, owned, available, used, mateCost, unlockCost, unlocked } = tv;
+          const active = select === id;
+          return (
+            <button
+              key={id}
+              onClick={() => {
+                if (!unlocked) {
+                  say(`${name} is locked. Unlock it first.`);
+                  return;
+                }
+                setSelect(id);
+              }}
+              disabled={!unlocked}
+              className="px-3 py-2 rounded-lg border text-sm flex items-center gap-2"
+              style={{
+                background: active
+                  ? dark
+                    ? "#065f46"
+                    : "#d1fae5"
+                  : !unlocked
+                  ? dark
+                    ? "#1c1917"
+                    : "#f5f5f4"
+                  : dark
+                  ? "#1f2937"
                   : "#f3f4f6",
                 color: dark ? "#fff" : "#111",
-                borderColor: dark ? "#333" : "#e5e7eb",
+                borderColor: !unlocked
+                  ? dark
+                    ? "#4b5563"
+                    : "#d1d5db"
+                  : dark
+                  ? "#333"
+                  : "#e5e7eb",
               }}
             >
               <span
                 className="inline-block w-3 h-3 rounded-sm"
-                style={{ background: swatch }}
+                style={{ background: color }}
               />
-              {id === "erase"
-                ? `erase${i < 10 ? ` [${i}]` : ""}`
-                : `${id} ×${count}${
-                    i < 10 ? ` [${i}]` : ""
-                  }${mateCost ? ` · ${mateCost}🪙` : ""}`}
+              {icon} {name || id}
+              <span className={available > 0 ? "font-medium" : "opacity-50"}>
+                ×{available}
+              </span>
+              {(used > 0 || owned > 0) && (
+                <span className="text-xs opacity-70">
+                  ({used}/{owned} used)
+                </span>
+              )}
+              {mateCost > 0 && (
+                <span className="text-xs opacity-70">· {mateCost}🪙</span>
+              )}
+              {!unlocked && unlockCost > 0 && (
+                <span className="text-xs opacity-80">
+                  · 🔒 {unlockCost.toLocaleString()} MC
+                </span>
+              )}
             </button>
           );
         })}
+
         <button
           onClick={() => setRot((v) => (v + 90) % 360)}
           className="px-2 py-1 rounded-lg border"
@@ -927,6 +842,53 @@ export default function CityBuilder({ dark = true }) {
         </button>
       </div>
 
+      {/* Unlock panel */}
+      {showUnlock && (
+        <div className="mb-3 p-3 rounded-lg border border-amber-400/60 bg-amber-50/80 dark:bg-stone-900/80 dark:border-stone-600">
+          <div className="flex items-center justify-between mb-2">
+            <div className="font-semibold text-sm flex items-center gap-2">
+              🔓 Unlock buildings
+            </div>
+            <button
+              onClick={() => setShowUnlock(false)}
+              className="text-xs px-2 py-1 rounded border border-transparent hover:border-stone-500"
+            >
+              close
+            </button>
+          </div>
+          {lockedTiles.length === 0 ? (
+            <div className="text-xs opacity-70">
+              All buildings are currently unlocked.
+            </div>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              {lockedTiles.map((tv) => (
+                <button
+                  key={tv.id}
+                  onClick={() => handleUnlockTile(tv.id)}
+                  className="px-3 py-2 rounded-lg border text-xs flex flex-col items-start gap-1"
+                  style={{
+                    background: dark ? "#111827" : "#f9fafb",
+                    borderColor: dark ? "#4b5563" : "#e5e7eb",
+                  }}
+                >
+                  <div className="flex items-center gap-2">
+                    <span>{tv.icon}</span>
+                    <span className="font-medium">{tv.name}</span>
+                    <span className="opacity-70 text-[0.7rem]">
+                      ({tv.categoryName})
+                    </span>
+                  </div>
+                  <div className="opacity-80">
+                    🔒 {tv.unlockCost.toLocaleString()} MC
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Board */}
       <div
         ref={wrapRef}
@@ -934,13 +896,14 @@ export default function CityBuilder({ dark = true }) {
         style={{
           height: 420,
           maxHeight: 420,
-          overflow: "hidden", // clip grid so it never overlaps footer
+          overflow: "hidden",
           borderColor: dark ? "#2a2a2a" : "#e7e5e4",
           background: dark ? "#0b0b0b" : "#fff",
         }}
       >
         <div
           ref={gridRef}
+          onClick={onClick}
           onMouseDown={onMouseDown}
           onMouseUp={onMouseUp}
           onContextMenu={(e) => e.preventDefault()}
@@ -958,7 +921,7 @@ export default function CityBuilder({ dark = true }) {
             imageRendering: "pixelated",
           }}
         >
-          {/* Locked area overlay (clipped by wrapper so it can't bleed) */}
+          {/* Locked cells */}
           {lockedCells.map((cell) => (
             <div
               key={`lock-${cell.x}-${cell.y}`}
@@ -973,6 +936,8 @@ export default function CityBuilder({ dark = true }) {
               }}
             />
           ))}
+
+          {/* Unlocked bounds outline */}
           {unlockedBounds && (
             <div
               style={{
@@ -991,14 +956,15 @@ export default function CityBuilder({ dark = true }) {
             />
           )}
 
-          {Array.from(placedMap.values()).map((t) => {
+          {/* Placed tiles */}
+          {placed.map((t) => {
             const key = `${t.x},${t.y}`;
             const explicitRB = t.id === "roundabout";
             const autoRB =
               (t.id === "road" || t.id === "avenue") &&
               autoRoundaboutKeys.has(key);
-            const col =
-              PALETTE[t.id]?.color || colorFromId(t.id);
+            const tileInfo = ui.getTileInfo(t.id);
+            const col = tileInfo.color;
 
             if (explicitRB) {
               const base = dark ? "#343434" : "#9aa0a6";
@@ -1014,9 +980,7 @@ export default function CityBuilder({ dark = true }) {
                     width: cellSize,
                     height: cellSize,
                     background: base,
-                    border: `1px solid ${
-                      dark ? "#111" : "#fff"
-                    }`,
+                    border: `1px solid ${dark ? "#111" : "#fff"}`,
                     borderRadius: 4,
                   }}
                 >
@@ -1028,9 +992,7 @@ export default function CityBuilder({ dark = true }) {
                       width: cellSize * 0.6,
                       height: cellSize * 0.6,
                       borderRadius: "9999px",
-                      background: dark
-                        ? "#15171a"
-                        : "#ffffff",
+                      background: dark ? "#15171a" : "#ffffff",
                       boxShadow: `0 0 0 ${Math.max(
                         1,
                         Math.floor(cellSize * 0.06)
@@ -1054,9 +1016,7 @@ export default function CityBuilder({ dark = true }) {
                   height: cellSize,
                   transform: `rotate(${t.rot || 0}deg)`,
                   background: col,
-                  border: `1px solid ${
-                    dark ? "#111" : "#fff"
-                  }`,
+                  border: `1px solid ${dark ? "#111" : "#fff"}`,
                   borderRadius: autoRB ? cellSize : 4,
                   boxShadow: autoRB
                     ? dark
@@ -1067,13 +1027,13 @@ export default function CityBuilder({ dark = true }) {
               />
             );
           })}
+
+          {/* Ghost cursor */}
           <div
             ref={ghostRef}
             style={{
               position: "absolute",
-              border: `2px dashed ${
-                dark ? "#86efac" : "#10b981"
-              }`,
+              border: `2px dashed ${dark ? "#86efac" : "#10b981"}`,
               borderRadius: 6,
               opacity: 0,
               pointerEvents: "none",
@@ -1090,95 +1050,4 @@ export default function CityBuilder({ dark = true }) {
       )}
     </div>
   );
-}
-
-/* ---------- helpers ---------- */
-function clamp(v, a, b) {
-  return Math.max(a, Math.min(b, v));
-}
-function mapInv(raw) {
-  const out = {};
-  for (const [k, v] of Object.entries(raw || {})) {
-    const id = normalizeId(k);
-    out[id] = (out[id] ?? 0) + (v | 0);
-  }
-  return out;
-}
-function colorFromId(id = "") {
-  let h = 0;
-  for (let i = 0; i < id.length; i++)
-    h = (h * 31 + id.charCodeAt(i)) >>> 0;
-  const r = 120 + (h & 0x3f),
-    g = 120 + ((h >> 6) & 0x3f),
-    b = 120 + ((h >> 12) & 0x3f);
-  return `rgb(${r},${g},${b})`;
-}
-function tilesToGrid(tiles, w, h) {
-  const grid = Array.from({ length: h }, () =>
-    Array.from({ length: w }, () => "")
-  );
-  for (const t of tiles || []) {
-    const x = t.x | 0,
-      y = t.y | 0;
-    if (y >= 0 && y < h && x >= 0 && x < w)
-      grid[y][x] = normalizeId(t.id);
-  }
-  return grid;
-}
-function gridToTiles(grid) {
-  const out = [];
-  if (!Array.isArray(grid)) return out;
-  for (let y = 0; y < grid.length; y++)
-    for (let x = 0; x < grid[y].length; x++)
-      if (grid[y][x])
-        out.push({
-          x,
-          y,
-          id: normalizeId(grid[y][x]),
-          rot: 0,
-        });
-  return out;
-}
-function toMap(tiles) {
-  const m = new Map();
-  (tiles || []).forEach((t) => {
-    if (
-      Number.isFinite(t.x) &&
-      Number.isFinite(t.y) &&
-      t.id
-    ) {
-      m.set(`${t.x},${t.y}`, {
-        x: t.x,
-        y: t.y,
-        id: normalizeId(t.id),
-        rot: t.rot || 0,
-      });
-    }
-  });
-  return m;
-}
-/** Ignore tiny “seed” maps. */
-function shouldIgnoreSeed(grid) {
-  if (!Array.isArray(grid) || grid.length === 0) return true;
-  let total = 0,
-    roads = 0,
-    homes = 0,
-    poi = 0;
-  for (let y = 0; y < grid.length; y++) {
-    const row = grid[y] || [];
-    for (let x = 0; x < row.length; x++) {
-      const id = normalizeId(row[x]);
-      if (!id) continue;
-      total++;
-      if (
-        id === "road" ||
-        id === "avenue" ||
-        id === "roundabout"
-      )
-        roads++;
-      else if (id === "home") homes++;
-      else poi++;
-    }
-  }
-  return total <= 24 && roads <= 16 && homes <= 1 && poi === 0;
 }

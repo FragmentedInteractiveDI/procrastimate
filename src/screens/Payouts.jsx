@@ -622,8 +622,14 @@ function amountFor(h) {
     return fmtUSD(h.amt);
   }
 
-  // micro-based coin entries (passive + direct micro deposits)
-  if (k === "micro_add" || k.includes("_micro") || k === "offline_catchup" || k === "store_buy") {
+  // micro-based coin entries (passive + direct micro deposits + builder unlocks)
+  if (
+    k === "micro_add" ||
+    k.includes("_micro") ||
+    k === "offline_catchup" ||
+    k === "store_buy" ||
+    k === "builder_unlock"
+  ) {
     return `${toMate(h.amt)} 🪙`;
   }
 

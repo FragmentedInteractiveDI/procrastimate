@@ -1,5 +1,8 @@
 // FILE: src/game/scenes/systems/GridSystem.js
 // Grid calculations, cell math, road detection, and spatial queries
+// NOW EXTENDS BaseSystem for lifecycle management
+
+import { BaseSystem } from './BaseSystem.js';
 
 const TILE = 28;
 const LANE_OFFSET = Math.round(TILE * 0.18);
@@ -55,22 +58,18 @@ export function lanePositionFor(gx, gy, dir, isRoundabout) {
   if (!isRoundabout) {
     // For horizontal roads (moving east/west)
     if (Math.abs(dir.x) > 0) {
-      // East (going right): bottom/lower lane (stay on right side)
-      // West (going left): top/upper lane (stay on right side)
       const yOffset = dir.x > 0 ? LANE_OFFSET : -LANE_OFFSET;
       return { x: cx, y: cy + yOffset };
     }
     // For vertical roads (moving north/south)
     else {
-      // North (going up): right lane (stay on right side)
-      // South (going down): left lane (stay on right side)
       const xOffset = dir.y > 0 ? -LANE_OFFSET : LANE_OFFSET;
       return { x: cx + xOffset, y: cy };
     }
   }
 
   // Roundabouts: offset along a ring path (counter-clockwise for right-hand traffic)
-  const ring = Math.round(TILE * 0.25); // Reduced to 0.25 - much closer to center
+  const ring = Math.round(TILE * 0.25);
   if (dir.x > 0) return { x: cx, y: cy + ring };
   if (dir.x < 0) return { x: cx, y: cy - ring };
   if (dir.y > 0) return { x: cx - ring, y: cy };
@@ -79,70 +78,60 @@ export function lanePositionFor(gx, gy, dir, isRoundabout) {
 
 /**
  * GridSystem handles all spatial calculations and grid queries
+ * NOW EXTENDS BaseSystem for proper lifecycle management
  */
-export class GridSystem {
-  constructor(scene) {
-    this.scene = scene;
+export class GridSystem extends BaseSystem {
+  static dependencies = [];
+  
+  static defaultConfig = {
+    tileSize: TILE,
+    laneOffset: LANE_OFFSET,
+    noUturnNearRbCells: NO_UTURN_NEAR_RB_CELLS
+  };
+
+  constructor(scene, dependencies = {}, eventBus = null, config = {}) {
+    super(scene, dependencies, eventBus, config);
+  }
+
+  onInitialize() {
+    // GridSystem is ready immediately - no async setup needed
+    this.emit('grid:initialized', { w: this.scene.w, h: this.scene.h });
   }
 
   // ========== BASIC GRID QUERIES ==========
 
-  /**
-   * Convert pixel coordinates to grid cell
-   */
   pixToCell(px, py) {
     return { gx: Math.floor(px / TILE), gy: Math.floor(py / TILE) };
   }
 
-  /**
-   * Check if grid coordinates are inside the grid bounds
-   */
   isInsideGrid(gx, gy) {
     return gx >= 0 && gy >= 0 && gx < this.scene.w && gy < this.scene.h;
   }
 
-  /**
-   * Check if a grid cell is a road (using drive array)
-   */
   isRoadCell(gx, gy) {
     return this.isInsideGrid(gx, gy) && this.scene.drive[gy][gx];
   }
 
-  /**
-   * Check if pixel coordinates are on a road
-   */
   isRoadPixel(px, py) {
     const { gx, gy } = this.pixToCell(px, py);
     return this.isRoadCell(gx, gy);
   }
 
-  /**
-   * Check if coordinates are outside grid bounds
-   */
   leaveWorld(nx, ny) {
     const { gx, gy } = this.pixToCell(nx, ny);
     return !this.isInsideGrid(gx, gy);
   }
 
-  /**
-   * Check if a grid cell contains a road tile (road, avenue, or roundabout)
-   */
   isRoadTile(gx, gy) {
     if (gy < 0 || gy >= this.scene.h || gx < 0 || gx >= this.scene.w) return false;
     const b = normBase(this.scene.grid[gy]?.[gx]);
     return b === "road" || b === "avenue" || b === "roundabout";
   }
 
-  /**
-   * Check if a grid cell is a roundabout
-   */
   isRoundaboutCell(gx, gy) {
     return normBase(this.scene.grid[gy]?.[gx]) === "roundabout";
   }
 
-  /**
-   * Get road neighbors (n, s, e, w) for a cell
-   */
   roadNeighbors(gx, gy) {
     return {
       n: this.isRoadTile(gx, gy - 1),
@@ -152,9 +141,6 @@ export class GridSystem {
     };
   }
 
-  /**
-   * Get road orientation (horizontal or vertical)
-   */
   roadOrientation(gx, gy) {
     const nb = this.roadNeighbors(gx, gy);
     const horiz = nb.w || nb.e;
@@ -164,28 +150,18 @@ export class GridSystem {
     return Math.random() < 0.5 ? "h" : "v";
   }
 
-  // ========== ROUNDABOUT DETECTION ==========
-
-  /**
-   * Check if a cell is near a roundabout (within NO_UTURN_NEAR_RB_CELLS)
-   */
   isRoundaboutNeighbor(gx, gy) {
     for (let dx = -NO_UTURN_NEAR_RB_CELLS; dx <= NO_UTURN_NEAR_RB_CELLS; dx++) {
       for (let dy = -NO_UTURN_NEAR_RB_CELLS; dy <= NO_UTURN_NEAR_RB_CELLS; dy++) {
         if (dx === 0 && dy === 0) continue;
-        const x = gx + dx,
-          y = gy + dy;
+        const x = gx + dx;
+        const y = gy + dy;
         if (this.isInsideGrid(x, y) && this.isRoundaboutCell(x, y)) return true;
       }
     }
     return false;
   }
 
-  // ========== EDGE & SPAWN DETECTION ==========
-
-  /**
-   * Get all road cells on the edge of the grid
-   */
   edgeRoadCells() {
     const cells = [];
     for (let x = 0; x < this.scene.w; x++) {
@@ -203,12 +179,9 @@ export class GridSystem {
     return cells;
   }
 
-  /**
-   * Get edge position in a cell for a given direction
-   */
   edgePosition(gx, gy, newDir) {
     if (Math.abs(newDir.x) > 0) {
-      const x = (gx + (newDir.x > 0 ? 1 : 0)) * TILE; // Grid-relative
+      const x = (gx + (newDir.x > 0 ? 1 : 0)) * TILE;
       const y = lanePositionFor(gx, gy, newDir, this.isRoundaboutCell(gx, gy)).y;
       return { x, y };
     } else {
@@ -218,11 +191,6 @@ export class GridSystem {
     }
   }
 
-  // ========== MOVEMENT & PROGRESS ==========
-
-  /**
-   * Calculate how far through a cell an entity has traveled (0-1)
-   */
   cellProgress(dir, x, y, baseX, baseY) {
     if (Math.abs(dir.x) > 0) {
       return dir.x > 0 ? (x - baseX) / TILE : (baseX + TILE - x) / TILE;
@@ -230,16 +198,10 @@ export class GridSystem {
     return dir.y > 0 ? (y - baseY) / TILE : (baseY + TILE - y) / TILE;
   }
 
-  // ========== TURN PLANNING ==========
-
-  /**
-   * Check if a turn is valid (first and second cells are roads and enterable)
-   */
   canPlanTurnFrom(cNow, _dir, chooseDir, nowSec) {
     const first = { x: cNow.gx + chooseDir.x, y: cNow.gy + chooseDir.y };
     const second = { x: first.x + chooseDir.x, y: first.y + chooseDir.y };
 
-    // Safety check: ensure trafficSystem exists
     if (!this.scene.trafficSystem || !this.scene.trafficSystem.canEnterLane) {
       console.warn("TrafficSystem not ready in canPlanTurnFrom");
       return null;
@@ -252,9 +214,6 @@ export class GridSystem {
     return ok1 && ok2 ? { first, second } : null;
   }
 
-  /**
-   * Check if current position is a true cul-de-sac (dead end)
-   */
   trueCulDeSac(cNow, dir) {
     const f1 = { x: cNow.gx + dir.x, y: cNow.gy + dir.y };
     if (this.isRoadCell(f1.x, f1.y)) {
@@ -263,9 +222,11 @@ export class GridSystem {
       const l1 = { x: f1.x + l.x, y: f1.y + l.y };
       const r1 = { x: f1.x + r.x, y: f1.y + r.y };
       const f2 = { x: f1.x + dir.x, y: f1.y + dir.y };
-      if (this.isRoadCell(l1.x, l1.y) ||
-          this.isRoadCell(r1.x, r1.y) ||
-          this.isRoadCell(f2.x, f2.y)) {
+      if (
+        this.isRoadCell(l1.x, l1.y) ||
+        this.isRoadCell(r1.x, r1.y) ||
+        this.isRoadCell(f2.x, f2.y)
+      ) {
         return false;
       }
       return true;

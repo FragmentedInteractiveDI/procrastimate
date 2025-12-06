@@ -1,7 +1,10 @@
 // FILE: src/game/scenes/systems/RenderSystem.js
 // World rendering, road drawing, building rendering, and minimap
 
-import { getRoadTextureKey, getBuildingTextureKey } from "../../../assets/cityAssets.js";
+import {
+  getRoadTextureKey,
+  getBuildingTextureKey,
+} from "../../../assets/cityAssets.js";
 
 const TILE = 28;
 const GRASS_TINT = 0x4a5a3a;
@@ -20,17 +23,58 @@ function normBase(cell) {
   const str = String(cell);
   const at = str.indexOf("@");
   const raw = at === -1 ? str : str.slice(0, at);
+
   switch (raw) {
-    case "r": case "road":        return "road";
-    case "av": case "avenue":     return "avenue";
-    case "rb": case "roundabout": return "roundabout";
-    case "home": case "h":        return "home";
-    case "house":                 return "house";
-    case "s": case "shop":        return "shop";
-    case "p": case "park":        return "park";
-    case "hq":                    return "hq";
-    case "st": case "start":      return "start";
-    default:                      return raw;
+    case "r":
+    case "road":
+      return "road";
+    case "av":
+    case "avenue":
+      return "avenue";
+    case "rb":
+    case "roundabout":
+      return "roundabout";
+
+    case "home":
+    case "h":
+      return "home";
+
+    case "house":
+      return "house";
+
+    case "s":
+    case "shop":
+      return "shop";
+
+    case "p":
+    case "park":
+      return "park";
+
+    case "hq":
+      return "hq";
+
+    case "a":
+    case "apb":
+      return "apb";
+
+    case "b":
+    case "bank":
+      return "bank";
+
+    case "g":
+    case "garage":
+      return "garage";
+
+    case "ps":
+    case "paintshop":
+      return "paintshop";
+
+    case "st":
+    case "start":
+      return "start";
+
+    default:
+      return raw;
   }
 }
 
@@ -53,9 +97,9 @@ export class RenderSystem {
     const dg = this.scene.roadDetailGfx;
     if (!g || !dg) return;
 
-    // CRITICAL: Destroy old tile sprites before creating new ones
+    // Destroy old tile sprites before creating new ones
     if (this.tileSprites) {
-      this.tileSprites.forEach(sprite => sprite.destroy());
+      this.tileSprites.forEach((sprite) => sprite.destroy());
     }
     this.tileSprites = [];
 
@@ -82,19 +126,23 @@ export class RenderSystem {
           case "park":
             this.drawPark(g, px, py);
             break;
+
+          // All buildings go through the unified building renderer
           case "home":
           case "house":
-            this.drawHouse(g, px, py);
-            break;
           case "shop":
-            this.drawShop(g, px, py);
-            break;
           case "hq":
-            this.drawHQ(g, px, py);
+          case "apb":
+          case "bank":
+          case "garage":
+          case "paintshop":
+            this.drawBuilding(g, b, px, py);
             break;
+
           case "start":
             this.drawStart(g, px, py);
             break;
+
           default:
             this.drawEmpty(g, px, py);
             break;
@@ -130,22 +178,36 @@ export class RenderSystem {
     const nb = this.scene.gridSystem.roadNeighbors(gx, gy);
 
     // Determine which road sprite to use based on connections
-    const tileId = avenue ? 'avenue' : 'road';
-    const textureKey = getRoadTextureKey(tileId, { n: nb.n, s: nb.s, e: nb.e, w: nb.w });
+    const tileId = avenue ? "avenue" : "road";
+    const textureKey = getRoadTextureKey(tileId, {
+      n: nb.n,
+      s: nb.s,
+      e: nb.e,
+      w: nb.w,
+    });
 
     // Draw the PNG sprite if available, otherwise fallback to old method
     if (this.scene.textures.exists(textureKey)) {
-      // Grid-relative position (worldLayer handles offset)
-      const sprite = this.scene.add.image(x + TILE / 2, y + TILE / 2, textureKey);
+      // Use grid coordinates (no PADDING needed)
+      const sprite = this.scene.add.image(
+        x + TILE / 2,
+        y + TILE / 2,
+        textureKey
+      );
       sprite.setDisplaySize(TILE, TILE);
       sprite.setDepth(1);
-      this.scene.worldLayer.add(sprite); // Add to worldLayer for consistent zoom
+      this.scene.worldLayer.add(sprite);
       this.tileSprites.push(sprite);
     } else {
       // Fallback to procedural graphics if PNG not loaded
       g.fillStyle(avenue ? 0x2e2e2e : 0x343434, 1).fillRect(x, y, TILE, TILE);
-      g.lineStyle(1, 0x222222, 0.9).strokeRect(x + 0.5, y + 0.5, TILE - 1, TILE - 1);
-      
+      g.lineStyle(1, 0x222222, 0.9).strokeRect(
+        x + 0.5,
+        y + 0.5,
+        TILE - 1,
+        TILE - 1
+      );
+
       // Lane markings
       if (nb.w && nb.e) {
         const ymid = y + TILE / 2 - 1;
@@ -176,8 +238,12 @@ export class RenderSystem {
     const y = gy * TILE;
 
     // Draw the PNG sprite if available
-    if (this.scene.textures.exists('road_roundabout')) {
-      const sprite = this.scene.add.image(x + TILE / 2, y + TILE / 2, 'road_roundabout');
+    if (this.scene.textures.exists("road_roundabout")) {
+      const sprite = this.scene.add.image(
+        x + TILE / 2,
+        y + TILE / 2,
+        "road_roundabout"
+      );
       sprite.setDisplaySize(TILE, TILE);
       sprite.setDepth(1);
       this.scene.worldLayer.add(sprite);
@@ -187,7 +253,12 @@ export class RenderSystem {
       const cx = x + TILE / 2;
       const cy = y + TILE / 2;
       g.fillStyle(0x343434, 1).fillRect(x, y, TILE, TILE);
-      g.lineStyle(1, 0x222222, 0.9).strokeRect(x + 0.5, y + 0.5, TILE - 1, TILE - 1);
+      g.lineStyle(1, 0x222222, 0.9).strokeRect(
+        x + 0.5,
+        y + 0.5,
+        TILE - 1,
+        TILE - 1
+      );
       const rOuter = TILE * 0.26;
       const rInner = TILE * 0.14;
       dg.fillStyle(0x222326, 1).fillCircle(cx, cy, rOuter);
@@ -200,21 +271,12 @@ export class RenderSystem {
 
   /**
    * Draw empty terrain (grass)
+   * Uses graphics fillRect to match coordinate system with roads/buildings
    */
   drawEmpty(g, x, y) {
-    // Background ground: muted grass so it doesn't overpower roads/buildings
-    if (this.scene.textures.exists('terrain_grass')) {
-      const sprite = this.scene.add.image(x + TILE / 2, y + TILE / 2, 'terrain_grass');
-      sprite.setDisplaySize(TILE, TILE);
-      sprite.setDepth(0);
-      sprite.setTint(GRASS_TINT);
-      sprite.setAlpha(GRASS_ALPHA);
-      this.scene.worldLayer.add(sprite);
-      this.tileSprites.push(sprite);
-    } else {
-      // Slightly darker neutral fallback
-      g.fillStyle(0x181b20, 1).fillRect(x, y, TILE, TILE);
-    }
+    // Draw grass as simple tinted fill - matches the coordinate system perfectly
+    g.fillStyle(GRASS_TINT, GRASS_ALPHA);
+    g.fillRect(x, y, TILE, TILE);
   }
 
   /**
@@ -226,81 +288,71 @@ export class RenderSystem {
   }
 
   /**
-   * Draw a house building
+   * Generic building renderer – uses getBuildingTextureKey so
+   * home / house / shop / hq / apb / bank / garage / paintshop
+   * all pull from the manifest.
+   */
+  drawBuilding(g, buildingType, x, y) {
+    const mappedType = buildingType === "start" ? "home" : buildingType;
+    const texKey = getBuildingTextureKey(mappedType);
+
+    if (this.scene.textures.exists(texKey)) {
+      const sprite = this.scene.add.image(
+        x + TILE / 2,
+        y + TILE,
+        texKey
+      );
+      sprite.setOrigin(0.5, 1.0);
+
+      // Our art is 64px wide; scale down to TILE
+      const scale = TILE / 64;
+      sprite.setScale(scale);
+
+      sprite.setDepth(5);
+      this.scene.worldLayer.add(sprite);
+      this.tileSprites.push(sprite);
+    } else {
+      // Fallback colored block if asset missing
+      let color = 0x4a4a4a;
+      if (mappedType === "shop") color = 0x6078ff;
+      else if (mappedType === "hq") color = 0xb94b5e;
+      else if (mappedType === "apb") color = 0xff6b6b;
+      else if (mappedType === "bank") color = 0xd1b45a;
+      else if (mappedType === "garage") color = 0x9ca3af;
+      else if (mappedType === "paintshop") color = 0xff9ad5;
+
+      g.fillStyle(color, 1).fillRect(x, y, TILE, TILE);
+    }
+  }
+
+  /**
+   * Draw a house building (wrapper for generic building)
+   * - "house" uses building_house_generic
    */
   drawHouse(g, x, y) {
-    // Draw house building with 3/4 perspective
-    if (this.scene.textures.exists('house_small')) {
-      const sprite = this.scene.add.image(x + TILE / 2, y + TILE, 'house_small');
-      sprite.setOrigin(0.5, 1.0);
-
-      // Scale to fit width but maintain aspect ratio
-      const scale = TILE / 64;
-      sprite.setScale(scale);
-
-      sprite.setDepth(5);
-      this.scene.worldLayer.add(sprite);
-      this.tileSprites.push(sprite);
-    } else {
-      g.fillStyle(0x4a4a4a, 1).fillRect(x, y, TILE, TILE);
-    }
+    this.drawBuilding(g, "house", x, y);
   }
 
   /**
-   * Draw a shop building
+   * Draw a shop building (wrapper)
    */
   drawShop(g, x, y) {
-    // Shop uses PNG when available, else colored placeholder
-    if (this.scene.textures.exists("building_shop")) {
-      const sprite = this.scene.add.image(x + TILE / 2, y + TILE, "building_shop");
-      sprite.setOrigin(0.5, 1.0);
-      const scale = TILE / 64;
-      sprite.setScale(scale);
-      sprite.setDepth(5);
-      this.scene.worldLayer.add(sprite);
-      this.tileSprites.push(sprite);
-    } else {
-      g.fillStyle(0x6078ff, 1).fillRect(x, y, TILE, TILE);
-    }
+    this.drawBuilding(g, "shop", x, y);
   }
 
   /**
-   * Draw an HQ building
+   * Draw an HQ building (wrapper)
    */
   drawHQ(g, x, y) {
-    // HQ uses PNG when available, else colored placeholder
-    if (this.scene.textures.exists("building_hq")) {
-      const sprite = this.scene.add.image(x + TILE / 2, y + TILE, "building_hq");
-      sprite.setOrigin(0.5, 1.0);
-      const scale = TILE / 64;
-      sprite.setScale(scale);
-      sprite.setDepth(5);
-      this.scene.worldLayer.add(sprite);
-      this.tileSprites.push(sprite);
-    } else {
-      g.fillStyle(0xb94b5e, 1).fillRect(x, y, TILE, TILE);
-    }
+    this.drawBuilding(g, "hq", x, y);
   }
 
   /**
    * Draw the start tile (player's home)
    */
   drawStart(g, x, y) {
-    // Start tile uses house (player's home)
-    if (this.scene.textures.exists('house_small')) {
-      const sprite = this.scene.add.image(x + TILE / 2, y + TILE, 'house_small');
-      sprite.setOrigin(0.5, 1.0);
-
-      // Scale to fit width but maintain aspect ratio
-      const scale = TILE / 64;
-      sprite.setScale(scale);
-
-      sprite.setDepth(5);
-      this.scene.worldLayer.add(sprite);
-      this.tileSprites.push(sprite);
-    } else {
-      g.fillStyle(0xe2a23a, 1).fillRect(x, y, TILE, TILE);
-    }
+    // Start tile uses "home" (building_house_small_brown)
+    this.drawBuilding(g, "home", x, y);
   }
 
   // ========== MINIMAP RENDERING ==========
@@ -309,7 +361,11 @@ export class RenderSystem {
    * Draw the minimap
    */
   drawMinimap(force) {
-    if (!this.scene.minimapOn || !this.scene.uiCam || (this.scene.sys && this.scene.sys.isDestroyed)) {
+    if (
+      !this.scene.minimapOn ||
+      !this.scene.uiCam ||
+      (this.scene.sys && this.scene.sys.isDestroyed)
+    ) {
       return;
     }
 
@@ -333,13 +389,26 @@ export class RenderSystem {
     if (force || this.scene._mmDirty) {
       const g = this.scene.minimapBack;
       g.clear();
-      g.fillStyle(0x0b0e12, 0.68).fillRoundedRect(x - 6, y - 6, w + 12, h + 12, 8);
-      g.lineStyle(1, 0x3a3f46, 0.9).strokeRoundedRect(x - 6, y - 6, w + 12, h + 12, 8);
+      g.fillStyle(0x0b0e12, 0.68).fillRoundedRect(
+        x - 6,
+        y - 6,
+        w + 12,
+        h + 12,
+        8
+      );
+      g.lineStyle(1, 0x3a3f46, 0.9).strokeRoundedRect(
+        x - 6,
+        y - 6,
+        w + 12,
+        h + 12,
+        8
+      );
 
       for (let gy = 0; gy < this.scene.h; gy++) {
         for (let gx = 0; gx < this.scene.w; gx++) {
           const b = normBase(this.scene.grid[gy]?.[gx]);
           let col = 0x1f232a;
+
           if (b === "road") col = 0x3a3a3a;
           else if (b === "avenue") col = 0x747474;
           else if (b === "roundabout") col = 0x8a6d2b;
@@ -347,13 +416,26 @@ export class RenderSystem {
           else if (b === "shop") col = 0x5b7bd8;
           else if (b === "park") col = 0x2c8c4a;
           else if (b === "hq") col = 0xb24a5c;
+          else if (b === "apb") col = 0xff6b6b;
+          else if (b === "bank") col = 0xd1b45a;
+          else if (b === "garage") col = 0x9ca3af;
+          else if (b === "paintshop") col = 0xec4899;
           else if (b === "start") col = 0xe0a134;
+
           if (!this.scene.revealSystem.isRevealed(gx, gy)) col = 0x0b0b0b;
-          g.fillStyle(col, 1).fillRect(x + gx * tile, y + gy * tile, tile, tile);
+
+          g.fillStyle(col, 1).fillRect(
+            x + gx * tile,
+            y + gy * tile,
+            tile,
+            tile
+          );
         }
       }
 
-      this.scene.mmZone.setPosition(x - 6, y - 6).setSize(w + 12, h + 12);
+      this.scene.mmZone
+        .setPosition(x - 6, y - 6)
+        .setSize(w + 12, h + 12);
       this.scene._mmDirty = false;
       this.scene._mmNextOverlayAt = 0;
     }
@@ -362,11 +444,27 @@ export class RenderSystem {
     if (now >= this.scene._mmNextOverlayAt) {
       const og = this.scene.minimapOverlay;
       og.clear();
-      const pc = this.scene.gridSystem.pixToCell(this.scene.car.x, this.scene.car.y);
-      og.fillStyle(0xffcc66, 1).fillRect(x + pc.gx * tile, y + pc.gy * tile, tile, tile);
+      const pc = this.scene.gridSystem.pixToCell(
+        this.scene.car.x,
+        this.scene.car.y
+      );
+      og.fillStyle(0xffcc66, 1).fillRect(
+        x + pc.gx * tile,
+        y + pc.gy * tile,
+        tile,
+        tile
+      );
       if (this.scene.apb && this.scene.cop?.visible) {
-        const cc = this.scene.gridSystem.pixToCell(this.scene.cop.x, this.scene.cop.y);
-        og.fillStyle(0xff5577, 1).fillRect(x + cc.gx * tile, y + cc.gy * tile, tile, tile);
+        const cc = this.scene.gridSystem.pixToCell(
+          this.scene.cop.x,
+          this.scene.cop.y
+        );
+        og.fillStyle(0xff5577, 1).fillRect(
+          x + cc.gx * tile,
+          y + cc.gy * tile,
+          tile,
+          tile
+        );
       }
       this.scene._mmNextOverlayAt = now + overlayInterval;
     }
@@ -377,7 +475,7 @@ export class RenderSystem {
    */
   destroy() {
     if (this.tileSprites) {
-      this.tileSprites.forEach(sprite => sprite.destroy());
+      this.tileSprites.forEach((sprite) => sprite.destroy());
     }
     this.tileSprites = [];
   }
